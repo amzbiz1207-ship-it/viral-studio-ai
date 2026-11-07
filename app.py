@@ -202,7 +202,10 @@ def run_ai(kind: str, subject: str, extra: str = "") -> str:
 
 
 if S.page == "studio":
-    st.markdown("""<div class="studio-hero"><div class="studio-kicker">VIRAL STUDIO AI / CREATOR WORKSPACE</div><h1>Создавай то, что хочется досмотреть</h1><p>Одна идея → сценарий, карусель, контент-план или визуальный промпт. Все инструменты в одном месте.</p></div>""", unsafe_allow_html=True) if S.ui_lang == "RU" else st.markdown("""<div class="studio-hero"><div class="studio-kicker">VIRAL STUDIO AI / CREATOR WORKSPACE</div><h1>Make content worth watching</h1><p>One idea → a script, carousel, content calendar or visual prompt. All in one workspace.</p></div>""", unsafe_allow_html=True)
+    if S.ui_lang == "RU":
+        st.markdown("""<div class="studio-hero"><div class="studio-kicker">VIRAL STUDIO AI / CREATOR WORKSPACE</div><h1>Создавай то, что хочется досмотреть</h1><p>Одна идея → сценарий, карусель, контент-план или визуальный промпт. Все инструменты в одном месте.</p></div>""", unsafe_allow_html=True)
+    else:
+        st.markdown("""<div class="studio-hero"><div class="studio-kicker">VIRAL STUDIO AI / CREATOR WORKSPACE</div><h1>Make content worth watching</h1><p>One idea → a script, carousel, content calendar or visual prompt. All in one workspace.</p></div>""", unsafe_allow_html=True)
     st.caption(tr("Рабочая версия: бесплатные черновики без API; интеллектуальная генерация при подключении Gemini; живой поиск — через YouTube API.",
                   "Working prototype: free editable drafts without API; AI generation with Gemini; live discovery through YouTube API."))
     idea_text = st.text_area(tr("Расскажи, что хочешь сделать", "Describe your idea"),
@@ -317,7 +320,7 @@ elif S.page == "dashboard":
     col4.metric(tr("Роликов с метриками", "Tracked videos"),len(S.videos))
     left,right=st.columns([1.15,1])
     with left:
-        st.markdown(f'<div class="v-card"><span class="v-tag">{safe_html(p["platform"])}</span><h3>{tr("Твой профиль", "Your profile")}</h3><p><b>{tr("Ниша", "Niche")}:</b> {p["niche"]}</p><p><b>{tr("Аудитория", "Audience")}:</b> {p["audience"]}</p><p><b>{tr("Стиль", "Tone")}:</b> {p["tone"]}</p></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="v-card"><span class="v-tag">{safe_html(p["platform"])}</span><h3>{tr("Твой профиль", "Your profile")}</h3><p><b>{tr("Ниша", "Niche")}:</b> {safe_html(str(p["niche"]))}</p><p><b>{tr("Аудитория", "Audience")}:</b> {safe_html(str(p["audience"]))}</p><p><b>{tr("Стиль", "Tone")}:</b> {safe_html(str(p["tone"]))}</p></div>', unsafe_allow_html=True)
         st.subheader(tr("Быстрый сценарий", "Quick script"))
         quick = st.text_input(tr("Тема следующего ролика", "Next video topic"), value=S.selected_topic or "How a chicken egg forms")
         if st.button(tr("Открыть редактор сценария →", "Open script editor →"),type="primary"):
@@ -543,7 +546,7 @@ elif S.page == "team":
 
 elif S.page == "settings":
     header("09 / DATA & PRIVACY",tr("Настройки и экспорт", "Settings & export"),tr("Сохрани свои проекты в файл, чтобы не потерять данные между сессиями.", "Export your projects so that they survive browser sessions."))
-    st.warning(tr("Это прототип без входа и удалённой базы. Не используй его как общий клиентский кабинет. Данные Streamlit-сессии могут исчезнуть при перезапуске.", "This is a prototype without accounts or durable cloud storage. Session data can be lost on restart."))
+    st.warning(tr("Вход защищён общим паролем, но это не многопользовательский кабинет и не облачная база данных. Данные сессии могут исчезнуть после перезапуска; регулярно скачивай резервную копию.", "A shared password protects entry, but this is not multi-user authentication or durable cloud storage. Session data may disappear on restart; export backups regularly."))
     payload=data_export(S.projects,S.current,S.library,S.videos)
     st.download_button(tr("↓ Скачать все данные JSON", "↓ Export all data as JSON"),data=json.dumps(payload,ensure_ascii=False,indent=2),file_name="viral_studio_backup.json",mime="application/json",type="primary")
     f=st.file_uploader(tr("Восстановить из JSON-файла", "Restore from JSON backup"),type="json")
