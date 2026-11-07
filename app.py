@@ -2,6 +2,7 @@
 from __future__ import annotations
 import json
 import os
+import hmac
 from html import escape as safe_html
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +12,40 @@ from services import ApiError, get_youtube_video, search_youtube, gemini_generat
 from studio_tools import RECIPES, CATALOG, GROUPS, title as recipe_title, route_request, fallback_draft, ai_prompts
 
 st.set_page_config(page_title="Viral Studio AI", page_icon="🎬", layout="wide", initial_sidebar_state="expanded")
+
+# Personal access gate. Set APP_PASSWORD only in Streamlit Community Cloud > App settings > Secrets.
+# There is intentionally no fallback or hard-coded demo password.
+def _get_app_password() -> str:
+    try:
+        configured = st.secrets.get("APP_PASSWORD", "")
+    except (FileNotFoundError, OSError):
+        configured = ""
+    return str(configured or os.environ.get("APP_PASSWORD", ""))
+
+
+_APP_PASSWORD = _get_app_password()
+if not _APP_PASSWORD:
+    st.error(
+        "🔒 Доступ закрыт: администратор пока не добавил APP_PASSWORD в Secrets. "
+        "Access locked: configure APP_PASSWORD in Streamlit Secrets."
+    )
+    st.stop()
+
+if not st.session_state.get("_viral_authenticated", False):
+    st.markdown("## 🎬 Viral Studio AI")
+    st.subheader("🔒 Личный вход / Private access")
+    st.caption("Для работы с приложением введите личный пароль. / Enter your password.")
+    with st.form("viral_private_login"):
+        entered_password = st.text_input("Пароль / Password", type="password")
+        login_clicked = st.form_submit_button("Войти / Sign in", type="primary")
+    if login_clicked:
+        if hmac.compare_digest(entered_password.encode("utf-8"), _APP_PASSWORD.encode("utf-8")):
+            st.session_state["_viral_authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Неверный пароль / Incorrect password")
+    st.stop()
+
 
 CSS = """
 <style>
@@ -111,6 +146,9 @@ def make_prompt(kind: str, subject: str, extra: str = "") -> tuple[str,str]:
 
 with st.sidebar:
     st.markdown("## 🎬 Viral Studio **AI**")
+    if st.button("🔒 Выйти / Sign out", key="private_logout"):
+        st.session_state["_viral_authenticated"] = False
+        st.rerun()
     st.caption("Independent creator workspace · MVP 2.0")
     S.ui_lang = st.segmented_control("Language / Язык", ["RU", "EN"], default="RU", key="language_ui")
     names = list(S.projects)
