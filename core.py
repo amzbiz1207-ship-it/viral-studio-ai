@@ -59,23 +59,25 @@ def days_since(published: str | None) -> float:
 
 
 def sample_hooks(topic: str, niche: str, lang: str) -> list[tuple[str, str]]:
-    t = topic.strip() or ("эта тема" if lang == "RU" else "this topic")
-    if lang == "RU":
+    """Grammatically sound editable hook sketches, never fake facts."""
+    t = (topic or '').strip().rstrip('?! .') or ('этот процесс' if lang == 'RU' else 'this process')
+    is_question=(topic or '').strip().endswith('?')
+    if lang == 'RU':
+        focus=t[0].lower()+t[1:] if t else t
         return [
-            ("Вопрос", f"А вы знаете, что на самом деле происходит, когда {t.lower()}?"),
-            ("Ошибка", f"Большинство неправильно понимает тему «{t}»."),
-            ("Сцена", f"Представьте: прямо сейчас перед вами — «{t}»."),
-            ("Конкретика", f"За 30 секунд покажу главное про «{t}»."),
-            ("Неожиданность", f"Самое удивительное в теме «{t}» — не то, что кажется."),
+            ('Вопрос', f'{t}?'),
+            ('Ошибка', f'Что чаще всего понимают неправильно: {focus}?'),
+            ('Сцена', f'Посмотрим на процесс изнутри: {t}.'),
+            ('Конкретика', f'Разберём этот вопрос за 30 секунд: {t}.'),
+            ('Неожиданность', f'В этой теме есть неожиданная деталь. Какая именно?'),
         ]
     return [
-        ("Question", f"Do you know what really happens when we look at {t.lower()}?"),
-        ("Mistake", f"Most people misunderstand this about {t}."),
-        ("Scene", f"Picture this: you're watching {t} unfold up close."),
-        ("Specific", f"Here's what matters about {t} in 30 seconds."),
-        ("Surprise", f"The most surprising thing about {t} isn't what you think."),
+        ('Question', f'{t}?'),
+        ('Mistake', f'What do people often misunderstand about {t}?'),
+        ('Scene', f'Watch the process up close: {t}.'),
+        ('Specific', f'Let us unpack this in 30 seconds: {t}.'),
+        ('Surprise', 'The unexpected detail is hidden in plain sight.'),
     ]
-
 
 def demo_script(topic: str, niche: str, lang: str, duration: int = 30) -> str:
     """Rule-based writing aid, intentionally labeled as a TEMPLATE rather than AI output."""
@@ -102,6 +104,27 @@ def demo_script(topic: str, niche: str, lang: str, duration: int = 30) -> str:
 
 
 def demo_week(niche: str, lang: str) -> list[dict]:
+    if any(x in niche.casefold() for x in ('how things work','как это устроено')):
+        topics_ru=[
+          'Почему курица несёт яйца без петуха?',
+          'Почему птиц не бьёт током на проводах?',
+          'Как холодильник охлаждает продукты?',
+          'Правда ли, что страусы прячут голову в песок?',
+          'Как кровь движется по капиллярам?',
+          'Почему уткам зимой не холодно?',
+          'Как устроена шариковая ручка?',
+        ]
+        topics_en=[
+          'Why do hens lay eggs without a rooster?',
+          'Why can birds stand on power lines?',
+          'How does a refrigerator cool food?',
+          'Do ostriches really bury their heads?',
+          'How does blood flow through capillaries?',
+          'How do ducks stay warm in winter?',
+          'How does a ballpoint pen work?',
+        ]
+        return [{"day":i,"topic":topic,"format":"Shorts / Reels","status":"planned"}
+                for i,topic in enumerate(topics_ru if lang=='RU' else topics_en)]
     if lang == "RU":
         topics = [
             f"Самый неожиданный факт о теме «{niche}»",

@@ -1,6 +1,9 @@
 """Viral Studio AI — independent Streamlit prototype, RU/EN."""
 from __future__ import annotations
 import json
+import copy
+import hashlib
+import re
 import os
 import hmac
 from html import escape as safe_html
@@ -8,8 +11,10 @@ from datetime import datetime
 from pathlib import Path
 import streamlit as st
 from core import DAYS_RU, DAYS_EN, sample_hooks, demo_script, demo_week, format_num, youtube_id, data_export
-from services import ApiError, get_youtube_video, search_youtube, gemini_generate
+from services import ApiError, get_youtube_video, search_youtube, gemini_generate, deepseek_generate
 from studio_tools import RECIPES, CATALOG, GROUPS, title as recipe_title, route_request, fallback_draft, ai_prompts
+from storage import StateStore, StorageError, validate_restore
+from exports import filename, docx_bytes, pdf_bytes
 
 st.set_page_config(page_title="Viral Studio AI", page_icon="🎬", layout="wide", initial_sidebar_state="expanded")
 
@@ -85,41 +90,99 @@ h1 {font-weight:800!important;} h3 {font-weight:700!important;}
 st.markdown(CSS, unsafe_allow_html=True)
 
 S = st.session_state
-if "projects" not in S:
-    S.projects = {"My channel": {"niche":"How things work / Как это устроено", "audience":"Curious viewers aged 12+", "tone":"Clear, lively, scientifically accurate", "platform":"YouTube Shorts", "goal":"More organic views", "language":"EN", "duration":30, "handle":"", "week":[], "members":[]}}
-if "current" not in S: S.current = "My channel"
-if "library" not in S: S.library = []
-if "videos" not in S: S.videos = []
-if "results" not in S: S.results = []
-if "script" not in S: S.script = ""
-if "script_title" not in S: S.script_title = ""
-if "review" not in S: S.review = ""
-if "selected_topic" not in S: S.selected_topic = ""
-if "page" not in S: S.page = "studio"
-if "studio_recipe" not in S: S.studio_recipe = "reels_script"
-if "studio_output" not in S: S.studio_output = ""
-if "studio_output_type" not in S: S.studio_output_type = ""
-if "studio_group" not in S: S.studio_group = "All"
-
-
-def tr(ru: str, en: str) -> str:
-    return ru if S.ui_lang == "RU" else en
-
 
 def secret(name: str) -> str:
     try:
         return str(st.secrets.get(name, os.environ.get(name, "")))
-    except (FileNotFoundError, AttributeError):
+    except (FileNotFoundError, AttributeError, OSError):
         return os.environ.get(name, "")
+
+DEFAULT_PROFILE = {"niche":"", "audience":"", "tone":"", "platform":"Instagram Reels",
+                   "goal":"", "language":"EN", "output_language":"EN", "prompt_language":"EN",
+                   "duration":30, "handle":"", "week":[], "members":[]}
+DEFAULT_STATE = {"projects":{"My channel":{**DEFAULT_PROFILE, "niche":"How things work / Как это устроено",
+                        "audience":"Curious viewers aged 12+", "tone":"Clear, lively, scientifically accurate",
+                        "platform":"YouTube Shorts", "goal":"More organic views"}},
+                 "current":"My channel", "library":[], "videos":[], "saved_outputs":[],
+                 "language_output":"EN", "prompt_language":"EN"}
+DATA_KEYS = list(DEFAULT_STATE)
+
+def persistent_state():
+    return {k: copy.deepcopy(S.get(k, DEFAULT_STATE[k])) for k in DATA_KEYS}
+
+try:
+    store=StateStore(secret("SUPABASE_URL"),secret("SUPABASE_SERVICE_ROLE_KEY"))
+    storage_problem = ""
+except StorageError as e:
+    store = None
+    storage_problem = str(e)
+
+if "_data_loaded" not in S:
+    try:
+        data=store.load() if store else None
+        if data:
+            data=validate_restore({"schema":2,**data})
+        for k,v in (data or DEFAULT_STATE).items():
+            if k in DATA_KEYS: S[k]=copy.deepcopy(v)
+        S._data_loaded=True
+    except (StorageError, ValueError) as e:
+        storage_problem=str(e)
+        # Never silently replace stored data if storage is unavailable.
+        st.error("Saved data unavailable / Не удалось загрузить данные: " + storage_problem)
+        st.stop()
+for k,v in DEFAULT_STATE.items():
+    if k not in S: S[k]=copy.deepcopy(v)
+if S.current not in S.projects: S.current=next(iter(S.projects))
+for k, v in {"script":"", "script_title":"", "review":"", "selected_topic":"",
+             "page":"studio", "studio_recipe":"reels_script", "studio_output":"",
+             "studio_output_type":"", "studio_group":"All", "results":[],
+             "_pending_nav":None, "_last_save_error":""}.items():
+    if k not in S: S[k]=v
+
+def save_state():
+    if not store: raise StorageError(storage_problem or 'Storage not configured')
+    store.save(persistent_state())
+    S._last_save_error = ""
+
+def navigate(destination):
+    # Synchronise the sidebar widget on the NEXT run rather than overwriting its value.
+    S.page=destination
+    S._pending_nav=destination
+    try:
+        save_state()
+    except StorageError as e:
+        S._last_save_error=str(e)
+    st.rerun()
+
+def exports_ui(content, kind, subject, key):
+    st.caption(tr("Скачать материал", "Download material"))
+    cols=st.columns(3)
+    files=[('MD', content.encode('utf-8'),'md','text/markdown'),
+           ('Word', None,'docx','application/vnd.openxmlformats-officedocument.wordprocessingml.document'),
+           ('PDF', None,'pdf','application/pdf')]
+    for c,(label,blob,ext,mime) in zip(cols,files):
+        try:
+            if ext=='docx': blob=docx_bytes(subject,content)
+            if ext=='pdf': blob=pdf_bytes(subject,content)
+            with c:
+                st.download_button(label,blob,file_name=filename(kind,subject,ext),mime=mime,
+                                   key=f"{key}_{ext}",use_container_width=True)
+        except Exception as e:
+            with c: st.warning(f"{label}: {e}")
+
+def tr(ru: str, en: str) -> str:
+    return ru if S.ui_lang == "RU" else en
 
 
 def make_prompt(kind: str, subject: str, extra: str = "") -> tuple[str,str]:
     p = S.projects[S.current]
     base = (f"Creator profile: niche={p['niche']}; target audience={p['audience']}; "
             f"tone={p['tone']}; platform={p['platform']}; goal={p['goal']}; "
-            f"output_language={'Russian' if S.ui_lang == 'RU' else 'English'}. "
+            f"output_language={'Russian' if S.language_output == 'RU' else 'English'}. "
             "Avoid factual claims without evidence, guarantees of virality, and copied wording from competitor videos. "
-            "Create original, executable material. For factual content, highlight what must be verified.")
+            "Create original, executable material. For factual content, highlight what must be verified. "
+            "Produce all headings and explanations in the output language; generation prompts in English. "
+            "Never claim features or metrics not shown as available in the supplied facts.")
     if kind == "script":
         system = "You are a meticulous short-video producer and storyboard writer. " + base
         prompt = (f"Create a {p['duration']}-second script for this topic: {subject}. "
@@ -149,16 +212,21 @@ with st.sidebar:
     if st.button("🔒 Выйти / Sign out", key="private_logout"):
         st.session_state["_viral_authenticated"] = False
         st.rerun()
-    st.caption("Independent creator workspace · MVP 2.0")
+    st.caption("Independent creator workspace · MVP 3.0")
     S.ui_lang = st.segmented_control("Language / Язык", ["RU", "EN"], default="RU", key="language_ui")
     names = list(S.projects)
     idx = names.index(S.current) if S.current in names else 0
-    chosen = st.selectbox(tr("Проект", "Project"), names, index=idx)
+    if S.get("_pending_project"):
+        S.project_picker=S._pending_project
+        S._pending_project=None
+    chosen = st.selectbox(tr("Проект", "Project"), names, index=idx, key="project_picker")
     if chosen != S.current:
         S.current = chosen
+        S.language_output=S.projects[chosen].get("output_language","EN")
+        S.prompt_language=S.projects[chosen].get("prompt_language","EN")
         S.results = []
         S.script = ""
-        st.rerun()
+        navigate(S.page)
     menu = [
         ("studio",tr("✨ AI-студия и шаблоны", "✨ AI studio & templates")),
         ("dashboard",tr("🏠 Обзор", "🏠 Overview")),
@@ -173,17 +241,48 @@ with st.sidebar:
         ("settings",tr("⚙️ Настройки", "⚙️ Settings")),
     ]
     label_to_id = {label:key for key,label in menu}
-    selected = st.radio(tr("Разделы", "Sections"), [label for key,label in menu], index=next((i for i,(key,_) in enumerate(menu) if key==S.page),0))
-    S.page = label_to_id[selected]
+    if S.get("_pending_nav") or S.get("_nav_language") != S.ui_lang:
+        page_for_menu=S.get("_pending_nav") or S.page
+        S.nav_selection=next((label for key,label in menu if key==page_for_menu),menu[0][1])
+        S._pending_nav=None
+        S._nav_language=S.ui_lang
+    def _on_navigation():
+        S.page=label_to_id[S.nav_selection]
+    selected = st.radio(tr("Разделы", "Sections"), [label for key,label in menu],
+                        index=next((i for i,(key,_) in enumerate(menu) if key==S.page),0),
+                        key="nav_selection", on_change=_on_navigation)
+    if S.page != label_to_id[selected]: S.page=label_to_id[selected]
     st.divider()
     with st.expander(tr("🔑 Подключения API", "🔑 API connections")):
         S.gemini_key = st.text_input("Gemini API key", type="password", value=S.get("gemini_key", "") or secret("GEMINI_API_KEY"), help="Private session input; not included in exports")
         S.youtube_key = st.text_input("YouTube Data API key", type="password", value=S.get("youtube_key", "") or secret("YOUTUBE_API_KEY"))
-        S.gemini_model = st.text_input("Gemini model", value=S.get("gemini_model", "") or secret("GEMINI_MODEL") or "gemini-2.5-flash")
-        st.caption(tr("Ключи вводятся в этой сессии и не включаются в экспорт.", "Keys stay in this session and are not exported."))
+        S.gemini_model = st.text_input("Gemini model", value=secret("GEMINI_MODEL") or S.get("gemini_model", "") or "gemini-3.8-flash")
+        S.ai_provider = st.selectbox(tr("Нейросеть", "AI provider"),
+                                     ["Auto (Gemini → DeepSeek)", "Gemini", "DeepSeek"],
+                                     index=0, key="ai_provider_picker")
+        S.deepseek_key = st.text_input("DeepSeek API key",type="password",
+                                       value=secret("DEEPSEEK_API_KEY") or S.get("deepseek_key", ""))
+        st.caption(tr("Ключи не включаются в экспорт. Для постоянного подключения настрой Secrets.",
+                      "Keys are excluded from exports. Configure Secrets for persistent API access."))
+    if store and not store.remote:
+        st.warning(tr("Локальное сохранение: на Streamlit Community Cloud данные могут исчезнуть после перезапуска сервера. Для надёжного хранения подключи Supabase.",
+                      "Local storage: Streamlit Cloud can discard this data on redeploy/restart. Connect Supabase for durability."))
+    if S._last_save_error: st.error(tr("Сохранение не удалось: ", "Save failed: ")+S._last_save_error)
     st.caption(tr("Демонстрационный кабинет · без регистрации и оплаты", "Prototype workspace · no sign-up or payments"))
 
 p = S.projects[S.current]
+
+nav_a,nav_b,nav_c=st.columns([1,1,4])
+with nav_a:
+    if st.button(tr("← Назад", "← Back"), key="nav_back_button"):
+        navigate(S.get("previous_page","studio") if S.get("previous_page")!=S.page else "studio")
+with nav_b:
+    if st.button(tr("⌂ Инструменты", "⌂ Tools"), key="nav_home_button"):
+        navigate("studio")
+if S.get("_last_page") != S.page:
+    if S.get("_last_page") and S.get("_last_page")!=S.page:
+        S.previous_page=S._last_page
+    S._last_page=S.page
 
 
 def header(kicker: str, title: str, caption: str):
@@ -191,14 +290,38 @@ def header(kicker: str, title: str, caption: str):
 
 
 def add_library(kind: str, title: str, body: str, url: str = ""):
-    S.library.append({"type":kind, "title":title, "content":body, "url":url, "added":datetime.now().strftime("%Y-%m-%d %H:%M")})
+    item={"type":kind, "title":title, "content":body, "url":url,
+          "project":S.current, "added":datetime.now().strftime("%Y-%m-%d %H:%M")}
+    if any(x.get("project")==S.current and x.get("type")==kind and
+           (x.get("url") and x.get("url")==url or x.get("content")==body) for x in S.library):
+        st.info(tr("Материал уже сохранён — дубликат не создан.", "Already saved; no duplicate created."))
+        return
+    S.library.append(item)
+    try:
+        save_state()
+        st.success(tr("Сохранено в библиотеку", "Saved to library"))
+    except StorageError as exc:
+        st.error(tr("Не удалось сохранить: ", "Save failed: ")+str(exc))
 
 
 def run_ai(kind: str, subject: str, extra: str = "") -> str:
-    if not S.gemini_key:
-        raise ApiError(tr("Добавь Gemini API key в боковой панели. Без него доступен только шаблон.", "Add a Gemini API key in the sidebar. Without it, only templates are available."))
     system, prompt = make_prompt(kind, subject, extra)
-    return gemini_generate(S.gemini_key, S.gemini_model, system, prompt)
+    return generate_ai(system,prompt)
+
+
+def generate_ai(system, prompt):
+    provider=S.get("ai_provider","Auto (Gemini → DeepSeek)")
+    errors=[]
+    if provider != "DeepSeek" and S.gemini_key:
+        try: return gemini_generate(S.gemini_key,S.gemini_model,system,prompt)
+        except ApiError as e:
+            errors.append(str(e))
+            if provider == "Gemini" or ('503' not in str(e) and 'UNAVAILABLE' not in str(e)):
+                raise
+    if provider != "Gemini" and S.get("deepseek_key"):
+        try: return deepseek_generate(S.deepseek_key,system,prompt)
+        except ApiError as e: errors.append(str(e))
+    raise ApiError('; '.join(errors) or tr("Подключи API-ключ выбранной нейросети.", "Connect an API key for the selected provider."))
 
 
 if S.page == "studio":
@@ -208,14 +331,32 @@ if S.page == "studio":
         st.markdown("""<div class="studio-hero"><div class="studio-kicker">VIRAL STUDIO AI / CREATOR WORKSPACE</div><h1>Make content worth watching</h1><p>One idea → a script, carousel, content calendar or visual prompt. All in one workspace.</p></div>""", unsafe_allow_html=True)
     st.caption(tr("Рабочая версия: бесплатные черновики без API; интеллектуальная генерация при подключении Gemini; живой поиск — через YouTube API.",
                   "Working prototype: free editable drafts without API; AI generation with Gemini; live discovery through YouTube API."))
+    a_lang,b_lang,c_lang=st.columns(3)
+    with a_lang:
+        S.language_output=st.selectbox(tr("Язык материала", "Document language"),["EN","RU"],
+             index=["EN","RU"].index(S.language_output), format_func=lambda x: "English" if x=="EN" else "Русский")
+    with b_lang:
+        S.prompt_language=st.selectbox(tr("Язык промптов", "Prompt language"),["EN","RU"],
+             index=["EN","RU"].index(S.prompt_language), format_func=lambda x: "English" if x=="EN" else "Русский")
+    p["output_language"]=S.language_output
+    p["prompt_language"]=S.prompt_language
+    st.caption(tr("Язык сайта, документа и технических промптов выбираются отдельно.",
+                  "Interface, document and generation-prompt languages are independent."))
     idea_text = st.text_area(tr("Расскажи, что хочешь сделать", "Describe your idea"),
                             key="studio_idea",
                             placeholder=tr("Например: 30-секундный Shorts о том, как курица формирует яйцо. Реалистично, быстрые кадры, английская озвучка.",
                                            "For example: make a 30-second Short explaining how a hen forms an egg. Realistic, close-ups, English voiceover."),
                             height=110)
-    a,b,c=st.columns([1.35,1,1])
+    a,b,c,d=st.columns([1.6,1.3,1.0,1.0])
     with a:
-        if st.button(tr("✨ Подобрать инструмент по идее", "✨ Match tool to idea"), type="primary", use_container_width=True):
+        if st.button(tr("✨ Создать с AI", "✨ Generate with AI"),type="primary",use_container_width=True,key="generate_top"):
+            if not idea_text.strip():
+                st.warning(tr("Напиши задание выше, затем нажми «Создать с AI».",
+                              "Write a request above before generating."))
+            else:
+                S._generate_from_top=True
+    with b:
+        if st.button(tr("Подобрать инструмент (не создаёт)", "Suggest a tool (no generation)"), use_container_width=True):
             if not idea_text.strip():
                 st.warning(tr("Сначала напиши идею в поле выше.", "Start by entering your idea above."))
             else:
@@ -226,15 +367,13 @@ if S.page == "studio":
                     if chosen=="reels_teardown": S.review = ""
                 else:
                     S.studio_recipe = chosen
-                st.rerun()
-    with b:
-        if st.button(tr("🔍 Найти реальные видео", "🔍 Find real videos"), use_container_width=True):
-            S.page="trends"
-            st.rerun()
+                navigate(S.page)
     with c:
-        if st.button(tr("📅 Мой контент-план", "📅 My content calendar"), use_container_width=True):
-            S.page="week"
-            st.rerun()
+        if st.button(tr("🔍 Найти видео", "🔍 Discover"), use_container_width=True):
+            navigate("trends")
+    with d:
+        if st.button(tr("📅 План недели", "📅 Weekly plan"), use_container_width=True):
+            navigate("week")
 
     st.markdown("### " + tr("Выбери инструмент", "Explore tools"))
     display = {"All":tr("Все", "All"), "Videos":tr("Видео", "Videos"),
@@ -257,19 +396,21 @@ if S.page == "studio":
                             f'<div class="studio-tiletitle">{safe_html(r.ru if S.ui_lang=="RU" else r.en)}</div>'
                             f'<div class="studio-tiledesc">{safe_html(r.ru_desc if S.ui_lang=="RU" else r.en_desc)}</div></div>',
                             unsafe_allow_html=True)
-                if st.button(tr("Открыть →", "Open →") if not active else tr("✓ Выбрано", "✓ Selected"),
-                             key="recipe_"+r.slug, use_container_width=True):
+                if st.button(tr("Выбрать", "Select") if not active else tr("✓ Выбрано", "✓ Selected"),
+                             key="recipe_"+r.slug, use_container_width=True, disabled=active):
                     if r.kind=="navigate":
                         S.page=r.route
                     else:
                         S.studio_recipe=r.slug
                         S.studio_output=""
-                    st.rerun()
+                    navigate(S.page)
 
     selected=CATALOG.get(S.studio_recipe,CATALOG["reels_script"])
     st.divider()
     st.subheader(tr("Мастерская: ", "Workshop: ") + recipe_title(selected.slug,S.ui_lang))
     st.caption(selected.ru_desc if S.ui_lang=="RU" else selected.en_desc)
+    st.info(tr("Выбери инструмент, напиши задание выше и нажми «Создать с AI» ниже.",
+               "Select a tool, write your request above, then click Generate with AI below."))
     if not idea_text.strip():
         st.info(tr("Напиши идею в поле вверху. Можно использовать тему канала, если конкретная идея ещё не готова.",
                    "Enter an idea above. Your channel niche can be used as a starting point."))
@@ -279,16 +420,19 @@ if S.page == "studio":
             S.studio_output=fallback_draft(selected.slug,idea_text or p["niche"],p,S.ui_lang)
             S.studio_output_type="draft"
     with gen_b:
-        if st.button(tr("✨ Создать с Gemini", "✨ Generate with Gemini"),type="primary",use_container_width=True):
-            if not S.gemini_key:
-                st.warning(tr("Для интеллектуальной генерации нужен Gemini API key. Добавь его в разделе «Подключения API» слева.",
-                              "AI generation needs a Gemini API key. Add it under API connections in the sidebar."))
+        generated_from_bottom=st.button(tr("✨ Создать с AI", "✨ Generate with AI"),type="primary",use_container_width=True)
+        if generated_from_bottom or bool(S.pop("_generate_from_top",False)):
+            if not (S.gemini_key or S.get("deepseek_key")):
+                st.warning(tr("Добавь Gemini или DeepSeek API key слева.", "Connect Gemini or DeepSeek API key in the sidebar."))
             else:
-                sys_msg,prompt=ai_prompts(selected.slug,idea_text or p["niche"],p,S.ui_lang)
+                sys_msg,prompt=ai_prompts(selected.slug,idea_text or p["niche"],p,S.language_output)
+                sys_msg += (" Technical generator prompts must be in " + ("Russian" if S.prompt_language=="RU" else "English") + ". ")
+                sys_msg += " Only deliver the selected tool's output, do not append unrelated formats or scripts. "
                 try:
                     with st.spinner(tr("Готовим результат с Gemini…", "Creating with Gemini…")):
-                        S.studio_output=gemini_generate(S.gemini_key,S.gemini_model,sys_msg,prompt)
-                        S.studio_output_type="gemini"
+                        S.studio_output=generate_ai(sys_msg,prompt)
+                        S.studio_output_type="ai"
+                        add_library(selected.slug,(idea_text.strip() or p["niche"])[:90],S.studio_output)
                 except ApiError as e:
                     st.error(str(e))
     if S.studio_output:
@@ -299,14 +443,11 @@ if S.page == "studio":
                           "Gemini output. Verify claims, dates and production details before publishing."))
         with st.container(border=True):
             st.markdown(S.studio_output)
-        da,db=st.columns(2)
-        with da:
-            st.download_button(tr("↓ Скачать в Markdown", "↓ Download Markdown"),S.studio_output,
-                               file_name="viral_studio_result.md",mime="text/markdown",use_container_width=True)
-        with db:
-            if st.button(tr("♡ Сохранить в библиотеку", "♡ Save to library"), key="save_studio", use_container_width=True):
-                add_library(selected.slug,(idea_text.strip() or p["niche"])[:90],S.studio_output)
-                st.toast(tr("Сохранено в библиотеку", "Saved to library"))
+        exports_ui(S.studio_output,selected.slug,(idea_text.strip() or p["niche"])[:90],"studio_export")
+        if st.button(tr("♡ Сохранить в библиотеку", "♡ Save to library"), key="save_studio", use_container_width=True):
+            add_library(selected.slug,(idea_text.strip() or p["niche"])[:90],S.studio_output)
+        if st.button(tr("← Все инструменты", "← All tools"),key="studio_back"):
+            navigate("studio")
     st.caption(tr("Видео, изображения и работающие чат-боты здесь пока не создаются. Для них подключим отдельные инструменты и официальные интеграции.",
                   "Rendering video or images and deploying chatbots require separate integrations, not available in this version."))
 
@@ -325,8 +466,7 @@ elif S.page == "dashboard":
         quick = st.text_input(tr("Тема следующего ролика", "Next video topic"), value=S.selected_topic or "How a chicken egg forms")
         if st.button(tr("Открыть редактор сценария →", "Open script editor →"),type="primary"):
             S.selected_topic=quick
-            S.page="scripts"
-            st.rerun()
+            navigate("scripts")
     with right:
         st.markdown(f'<div class="v-card"><h3>{tr("Что действительно работает в этой версии", "What works in this version")}</h3><p>✓ {tr("Анкета, план, шаблоны и библиотека", "Profiles, plans, templates and library")}</p><p>✓ {tr("Настоящие данные YouTube при наличии API-ключа", "Real YouTube data when API is connected")}</p><p>✓ {tr("AI-сценарии при наличии Gemini API", "AI scripts when Gemini API is connected")}</p></div>', unsafe_allow_html=True)
         st.info(tr("Автопубликация, анализ Instagram/TikTok, многопользовательский доступ и генерация видео пока не подключены.", "Auto-posting, Instagram/TikTok analytics, multiuser access and video generation are not integrated yet."))
@@ -339,9 +479,13 @@ elif S.page == "profile":
         if not name: st.warning(tr("Введите название.", "Enter a name."))
         elif name in S.projects: st.warning(tr("Такой проект существует.", "This project exists."))
         else:
-            S.projects[name]={**{k:v for k,v in p.items() if k not in {"week","members"}}, "week":[], "members":[]}
+            S.projects[name]=copy.deepcopy(DEFAULT_PROFILE)
             S.current=name
-            st.rerun()
+            S.language_output=S.projects[name]["output_language"]
+            S.prompt_language=S.projects[name]["prompt_language"]
+            S._pending_project=name
+            st.toast(tr("Проект создан. Заполни его анкету.", "Project created. Fill out its profile."))
+            navigate("profile")
     a,b=st.columns(2)
     with a:
         p["niche"] = st.text_input(tr("Ниша", "Niche"), value=p["niche"])
@@ -352,22 +496,35 @@ elif S.page == "profile":
         p["platform"] = st.selectbox(tr("Главная платформа", "Main platform"),["YouTube Shorts","Instagram Reels","TikTok","Telegram","Pinterest"],index=["YouTube Shorts","Instagram Reels","TikTok","Telegram","Pinterest"].index(p["platform"]) if p["platform"] in ["YouTube Shorts","Instagram Reels","TikTok","Telegram","Pinterest"] else 0)
         p["goal"] = st.text_input(tr("Цель", "Goal"),value=p["goal"])
         p["duration"] = st.slider(tr("Длина видео (сек)", "Video duration (sec)"),min_value=12,max_value=60,value=int(p["duration"]))
-    st.success(tr("Изменения сохраняются в текущей сессии. Экспорт доступен в Настройках.", "Changes are saved in your current session. Export in Settings."))
+    st.caption(tr("Изменения автосохраняются в подключённом хранилище; надёжность зависит от выбранного способа хранения.",
+                  "Changes auto-save to the configured store; durability depends on its backend."))
 
 elif S.page == "trends":
     header("02 / DISCOVER", tr("Поиск популярных видео", "Discover high-performing videos"),
            tr("Данные YouTube, а не придуманные показатели. Приближённые сигналы, не гарантия вирусности.", "Real YouTube data, not invented metrics. Signals are not proof of virality."))
-    st.info(tr("Для реального поиска нужен YouTube Data API key в боковой панели. Instagram и TikTok пока не подключены.", "Add a YouTube Data API key in the sidebar for live search. Instagram and TikTok aren't connected."))
+    if S.youtube_key:
+        st.success(tr("YouTube API подключён. Ищем только видео, удовлетворяющие выбранным фильтрам.",
+                      "YouTube API connected. Only videos passing your filters are shown."))
+    else:
+        st.warning(tr("Для поиска добавь YouTube Data API key слева.", "Connect YouTube Data API key in the sidebar."))
     c1,c2,c3=st.columns([2,1,1])
     with c1: query = st.text_input(tr("Ниша / поисковый запрос", "Niche / search query"),value=p["niche"])
-    with c2: days = st.selectbox(tr("За период", "Published within"),[7,14,30,90],format_func=lambda n:tr(f"{n} дней",f"{n} days"))
+    with c2: days = st.selectbox(tr("За период", "Published within"),[1,3,7,30],index=2,format_func=lambda n:tr(f"{n} дней",f"{n} days"))
     with c3: language = st.selectbox(tr("Язык поиска", "Search language"),["en","ru","es","de","fr"],index=0 if S.ui_lang=="EN" else 1)
+    minviews_a,short_b=st.columns([2,1])
+    with minviews_a:
+        min_views=st.selectbox(tr("Минимум просмотров", "Minimum views"),[10000,100000,500000,1000000],index=1)
+    with short_b:
+        short_only=st.checkbox(tr("Короткие видео (до 3 минут)", "Short videos (up to 3 min)"),value=True)
+    st.caption(tr("YouTube не гарантирует идентификацию Shorts через API. Поиск может расходовать до 300 единиц квоты за раз.",
+                  "YouTube API cannot definitively identify Shorts; a search may cost up to 300 quota units."))
     if st.button(tr("Найти реальные видео", "Search real videos"),type="primary"):
         if not S.youtube_key: st.warning(tr("Сначала добавь YouTube API key.", "First add a YouTube API key."))
         else:
             try:
                 with st.spinner(tr("Получаем данные YouTube...", "Fetching YouTube data...")):
-                    S.results=search_youtube(query,S.youtube_key,days=days,language=language)
+                    S.results=search_youtube(query,S.youtube_key,days=days,language=language,
+                                             min_views=min_views,short_only=short_only)
             except ApiError as e: st.error(str(e))
     if S.results:
         st.caption(tr("Сортировка: средние просмотры в день (примерная оценка на основе даты публикации).", "Sorted by estimated views per day since publication."))
@@ -382,11 +539,16 @@ elif S.page == "trends":
                     st.caption(f"{v['channel']} · {v['published'][:10]} · {v['duration_s']}s")
                     st.write(f"👁 {format_num(v['views'])} · {tr('в день','per day')} {format_num(v['views_per_day'])} · {tr('просмотры/подписчики','views/subscribers')}: {v['view_to_subscriber'] if v['view_to_subscriber'] is not None else '—'}")
                     st.link_button(tr("Открыть ролик", "Open video"),v["url"])
+                    if st.button(tr("Анализировать →", "Analyze →"),key="analyze_"+v["id"]):
+                        S.review_url=v["url"]
+                        S.last_video=v
+                        navigate("review")
                     if st.button(tr("Сохранить в библиотеку", "Save to library"),key="save_"+v["id"]):
                         add_library("youtube",v["title"],f"Channel: {v['channel']}. Views: {v['views']}. Published: {v['published']}.",v["url"])
                         st.toast(tr("Добавлено", "Saved"))
     else:
-        st.markdown(f'<div class="v-card"><h3>{tr("Пустая лента — никаких фиктивных трендов", "No made-up trends")}</h3><p>{tr("После подключения официального YouTube API здесь появятся реальные ролики, просмотры и ссылки.", "After connecting the official YouTube API, real videos, views and links will appear here.")}</p></div>',unsafe_allow_html=True)
+        st.info(tr("Подходящие видео пока не найдены. Уменьши порог просмотров, расширь период или уточни запрос.",
+                   "No matching videos. Lower minimum views, widen dates, or refine the topic."))
 
 elif S.page == "scripts":
     header("03 / SCRIPT LAB",tr("Сценарист и 5 хуков", "Script lab & 5 hooks"),tr("Короткие, точные кадры, таймкоды и промпты для видео.", "Compact scenes, timing and prompts for AI-video tools."))
@@ -399,19 +561,21 @@ elif S.page == "scripts":
     a,b=st.columns(2)
     with a:
         if st.button(tr("Создать шаблон бесплатно", "Create free template"),use_container_width=True):
-            S.script=demo_script(topic,p["niche"],S.ui_lang,p["duration"])
+            S.script=demo_script(topic,p["niche"],S.language_output,p["duration"])
             S.script_title=topic
+            add_library("script",topic,S.script)
     with b:
         if st.button(tr("✨ Сгенерировать сценарий с Gemini", "✨ Generate with Gemini"),type="primary",use_container_width=True):
             try:
                 with st.spinner(tr("Создаём сценарий...", "Generating script...")):
                     S.script=run_ai("script",topic,extra)
                     S.script_title=topic
+                    add_library("script",topic,S.script)
             except ApiError as e: st.error(str(e))
     if S.script:
         st.divider()
         st.markdown(S.script)
-        st.download_button(tr("↓ Скачать сценарий .md", "↓ Download script .md"),S.script,file_name="viral_studio_script.md",mime="text/markdown")
+        exports_ui(S.script,"Script",S.script_title,"script_export")
         if st.button(tr("♡ Сохранить в библиотеку", "♡ Save in library")):
             add_library("script",S.script_title,S.script)
             st.toast(tr("Сценарий сохранён", "Script saved"))
@@ -441,8 +605,8 @@ elif S.page == "week":
         st.info(tr("Нажми кнопку выше, чтобы получить план. Шаблон не использует живые тренды.", "Use a button above to create your plan. The template does not use live trends."))
     else:
         labels=DAYS_RU if S.ui_lang=="RU" else DAYS_EN
-        status_options=["planned","filming","review","published"]
-        status_labels={"planned":tr("План", "Planned"),"filming":tr("Снимаем", "Filming"),"review":tr("Правки", "Review"),"published":tr("Опубликовано", "Published")}
+        status_options=["planned","filming","review","ready","published"]
+        status_labels={"planned":tr("План", "Planned"),"filming":tr("Снимаем", "Filming"),"review":tr("Правки", "Review"),"ready":tr("Готово к публикации", "Ready to publish"),"published":tr("Опубликовано", "Published")}
         for i,item in enumerate(p["week"]):
             with st.container(border=True):
                 top,stat,open_button=st.columns([3.6,1.4,1.2])
@@ -450,21 +614,26 @@ elif S.page == "week":
                     st.caption(labels[i])
                     item["topic"]=st.text_input(tr("Тема", "Topic"),value=item["topic"],key=f"topic_{S.current}_{i}",label_visibility="collapsed")
                 with stat:
-                    item["status"]=st.selectbox(tr("Статус", "Status"),status_options,index=status_options.index(item.get("status","planned")),format_func=lambda x:status_labels[x],key=f"status_{S.current}_{i}")
+                    item["status"]=st.selectbox(tr("Статус", "Status"),status_options,index=status_options.index(item.get("status","planned")) if item.get("status","planned") in status_options else 0,format_func=lambda x:status_labels[x],key=f"status_{S.current}_{i}")
                 with open_button:
                     st.caption(" ")
                     if st.button(tr("Сценарий →", "Script →"),key=f"scriptday_{S.current}_{i}"):
                         S.selected_topic=item["topic"]
-                        S.page="scripts"
-                        st.rerun()
+                        navigate("scripts")
         done=sum(x["status"]=="published" for x in p["week"])
         st.progress(done/7,text=tr(f"Опубликовано {done} из 7",f"Published {done} of 7"))
 
 elif S.page == "review":
     header("05 / VIDEO DECONSTRUCTION",tr("Разбор чужого ролика", "Video link analysis"),tr("Отделяем измеренные показатели от гипотез — без выдуманной транскрибации.", "We separate measured metrics from hypotheses and never invent a transcript."))
-    url=st.text_input(tr("Ссылка YouTube Shorts, Reels или TikTok", "YouTube Shorts, Reels or TikTok URL"),placeholder="https://www.youtube.com/shorts/...........")
+    url=st.text_input(tr("Ссылка YouTube Shorts, Reels или TikTok", "YouTube Shorts, Reels or TikTok URL"),
+                      value=S.get("review_url", ""),placeholder="https://www.youtube.com/shorts/...........",key="review_url_input")
     transcript=st.text_area(tr("Транскрибация / описание кадров (необязательно)", "Transcript / visual notes (optional)"),height=135,placeholder=tr("Вставь текст речи или свои заметки по кадрам", "Paste spoken dialogue or your own frame notes"))
     vid=youtube_id(url) if url else None
+    if S.get("review_url_input") != S.get("review_url"):
+        S.review_url=S.review_url_input
+        if S.get("last_video") and S.last_video.get("id")!=vid:
+            S.last_video=None
+            S.review=""
     if url and not vid:
         st.warning(tr("Автоматическая статистика сейчас доступна только для YouTube. Можно анализировать вручную вставленный текст других платформ.", "Automatic statistics currently support YouTube only. You can still analyze your own pasted text from other platforms."))
     if st.button(tr("Получить факты о видео", "Get video facts")):
@@ -482,31 +651,40 @@ elif S.page == "review":
         a.metric(tr("Просмотры", "Views"),format_num(v["views"]))
         b.metric(tr("Лайки", "Likes"),format_num(v["likes"]) if v["likes"] is not None else "—")
         c.metric(tr("В день (оценка)", "Per day (estimate)"),format_num(v["views_per_day"]))
-    if st.button(tr("✨ Анализировать через Gemini", "✨ Analyze with Gemini"),type="primary"):
+    if st.button(tr("✨ Получить факты и анализировать", "✨ Fetch facts and analyze"),type="primary"):
+        if vid and S.youtube_key and not (S.get("last_video") or {}).get("id")==vid:
+            try:
+                S.last_video=get_youtube_video(vid,S.youtube_key)
+            except ApiError as err: st.warning(str(err))
         video = S.get("last_video") if vid and (S.get("last_video") or {}).get("id")==vid else None
         metadata=(f"URL: {url}. Video title: {video.get('title','')}. Description: {video.get('description','')}. "
-                  f"Views: {video.get('views','not known')}. Published: {video.get('published','not known')}" if video else f"URL: {url}. Metadata unavailable")
+                  f"Views: {video.get('views','not known')}. Likes: {video.get('likes','not known')}. "
+                  f"Published: {video.get('published','not known')}. Duration: {video.get('duration_s','not known')} seconds. "
+                  f"Channel: {video.get('channel','not known')}." if video else f"URL: {url}. Metadata unavailable")
         try:
             with st.spinner(tr("Анализируем доступные данные...", "Analyzing available evidence...")):
                 S.review=run_ai("review",metadata,f"User-supplied transcript/scene notes: {transcript or 'NOT PROVIDED'}")
+                add_library("analysis",url or "Video analysis",S.review,url)
         except ApiError as e: st.error(str(e))
     if S.review:
         st.markdown(S.review)
-        st.download_button(tr("↓ Скачать разбор", "↓ Download review"),S.review,file_name="viral_studio_analysis.md",mime="text/markdown")
+        exports_ui(S.review,"Analysis",url or "Video", "review_export")
         if st.button(tr("Сохранить разбор", "Save analysis")):
             add_library("analysis",url or "Video analysis",S.review,url)
             st.toast(tr("Сохранено", "Saved"))
 
 elif S.page == "library":
     header("06 / CREATIVE VAULT",tr("Библиотека идей", "Saved content library"),tr("Сценарии и интересные ролики не теряются в переписке.", "Keep scripts, links and ideas together."))
-    if not S.library: st.info(tr("Пока нет сохранённых материалов. Добавь ролик или сценарий.", "Nothing saved yet. Save a video or a script."))
+    if not any(x.get("project","My channel")==S.current for x in S.library):
+        st.info(tr("В этом проекте пока нет сохранённых материалов.", "No saved material in this project yet."))
     for i,item in reversed(list(enumerate(S.library))):
+        if item.get("project","My channel") != S.current: continue
         with st.expander(f"{item['type'].upper()} · {item['title']} · {item['added']}"):
             if item.get("url"): st.link_button(tr("Открыть источник", "Open source"),item["url"])
             st.markdown(item["content"])
-            st.download_button(tr("Скачать текст", "Download text"),item["content"],file_name=f"saved_{i}.md",key=f"download_{i}")
+            exports_ui(item["content"],item["type"],item["title"],f"library_{i}")
             if st.button(tr("Удалить", "Delete"),key=f"delete_{i}"):
-                S.library.pop(i); st.rerun()
+                S.library.pop(i); navigate("library")
 
 elif S.page == "metrics":
     header("07 / PERFORMANCE",tr("Мои результаты", "My performance"),tr("Записывай реальные цифры опубликованных видео; никаких вымышленных графиков.", "Record real performance data from your published videos."))
@@ -522,8 +700,14 @@ elif S.page == "metrics":
             saves=st.number_input(tr("Сохранения", "Saves"),min_value=0,step=1)
         if st.form_submit_button(tr("Добавить результат", "Add result"),type="primary"):
             if title.strip():
-                S.videos.append({"title":title.strip(),"url":video_url,"views":int(views),"likes":int(likes),"comments":int(comments),"saves":int(saves),"project":S.current})
-                st.success(tr("Результат добавлен", "Result added"))
+                existing=next((v for v in S.videos if v.get("project")==S.current and
+                               ((video_url.strip() and v.get("url")==video_url.strip()) or
+                                (not video_url.strip() and v.get("title")==title.strip()))),None)
+                record={"title":title.strip(),"url":video_url.strip(),"views":int(views),"likes":int(likes),
+                        "comments":int(comments),"saves":int(saves),"project":S.current,
+                        "updated":datetime.now().isoformat(timespec="seconds")}
+                if existing: existing.update(record); st.info(tr("Существующая запись обновлена (без дубликата).", "Existing record updated (no duplicate)."))
+                else: S.videos.append(record); st.success(tr("Результат добавлен. Он появится в таблице ниже.", "Result added. See the table below."))
             else: st.warning(tr("Укажи название.", "Enter a title."))
     own=[v for v in S.videos if v["project"]==S.current]
     if own:
@@ -533,6 +717,14 @@ elif S.page == "metrics":
             rows.append({tr("Ролик", "Video"):v["title"],tr("Просмотры", "Views"):v["views"],tr("Лайки", "Likes"):v["likes"],tr("Комментарии", "Comments"):v["comments"],"Interactions / views %":engagement})
         st.dataframe(rows,use_container_width=True,hide_index=True)
         st.caption(tr("Показатель interactions/views — простое отношение введённых взаимодействий к просмотрам, не официальный ER платформы.", "Interactions/views is a basic ratio of entered interactions to views, not a platform's official engagement rate."))
+        st.subheader(tr("Управление записями", "Manage records"))
+        for i,v in enumerate(S.videos):
+            if v.get("project")!=S.current: continue
+            x,y=st.columns([5,1])
+            x.write(f"{v.get('title','')} · {v.get('views',0)} views")
+            if y.button(tr("Удалить", "Delete"),key=f"metric_del_{i}"):
+                S.videos.pop(i)
+                navigate("metrics")
 
 elif S.page == "team":
     header("08 / WORKSPACE",tr("Команда проекта", "Project team"),tr("Подготовка ролей продюсера, автора и монтажёра.", "Track producer, creator and editor roles."))
@@ -546,21 +738,26 @@ elif S.page == "team":
 
 elif S.page == "settings":
     header("09 / DATA & PRIVACY",tr("Настройки и экспорт", "Settings & export"),tr("Сохрани свои проекты в файл, чтобы не потерять данные между сессиями.", "Export your projects so that they survive browser sessions."))
-    st.warning(tr("Вход защищён общим паролем, но это не многопользовательский кабинет и не облачная база данных. Данные сессии могут исчезнуть после перезапуска; регулярно скачивай резервную копию.", "A shared password protects entry, but this is not multi-user authentication or durable cloud storage. Session data may disappear on restart; export backups regularly."))
-    payload=data_export(S.projects,S.current,S.library,S.videos)
+    if store and store.remote:
+        st.success(tr("Подключено постоянное облачное хранилище Supabase.", "Persistent Supabase cloud storage connected."))
+    else:
+        st.warning(tr("Работает локальная база SQLite. На Streamlit Cloud она может исчезнуть при перезапуске сервера или обновлении. Подключи Supabase по README для постоянного хранения.",
+                      "Local SQLite mode: Streamlit Cloud can reset it on redeploy or server restart. Configure Supabase for durability."))
+    payload={"schema":2,**persistent_state()}
     st.download_button(tr("↓ Скачать все данные JSON", "↓ Export all data as JSON"),data=json.dumps(payload,ensure_ascii=False,indent=2),file_name="viral_studio_backup.json",mime="application/json",type="primary")
     f=st.file_uploader(tr("Восстановить из JSON-файла", "Restore from JSON backup"),type="json")
     if f and st.button(tr("Восстановить данные", "Restore data")):
         try:
             content=json.load(f)
             assert content.get("schema")==1 and isinstance(content.get("projects"),dict) and content["projects"]
-            S.projects=content["projects"]
-            S.current=content.get("current") if content.get("current") in S.projects else next(iter(S.projects))
-            S.library=content.get("library",[])
-            S.videos=content.get("videos",[])
+            restored=validate_restore(content)
+            for k,v in restored.items(): S[k]=v
+            S.current=S.current if S.current in S.projects else next(iter(S.projects))
+            S._pending_project=S.current
             S.results=[]
+            save_state()
             st.success(tr("Данные восстановлены", "Backup restored"))
-            st.rerun()
+            navigate("settings")
         except (ValueError,AssertionError,TypeError,KeyError) as e:
             st.error(tr("Некорректный файл резервной копии.", "Invalid backup file."))
     st.subheader(tr("Что подключим дальше", "Future integrations"))
@@ -568,3 +765,15 @@ elif S.page == "settings":
 
 st.divider()
 st.caption("Viral Studio AI · Independent concept prototype · Unaffiliated with Virales.io or ChatPlace Virale · Data via official YouTube API only when connected")
+
+# Persist edits at the end of successful Streamlit runs. Explicit navigation saves before rerun.
+try:
+    _payload = persistent_state()
+    _digest = hashlib.sha256(json.dumps(_payload,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
+    if _digest != S.get("_saved_digest"):
+        save_state()
+        S._saved_digest=_digest
+except StorageError as e:
+    S._last_save_error=str(e)
+    st.error(tr("Не удалось сохранить изменения. Скачай резервную копию JSON и проверь хранилище: ",
+                "Changes were NOT saved. Download a JSON backup and check storage: ")+str(e))
