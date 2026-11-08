@@ -32,8 +32,14 @@ class StateStore:
                 db.execute('CREATE TABLE IF NOT EXISTS app_state (owner TEXT PRIMARY KEY, payload TEXT NOT NULL)')
 
     def _headers(self):
-        return {'apikey': self.key, 'Authorization': f'Bearer {self.key}',
-                'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates,return=minimal'}
+        headers = {'apikey': self.key, 'Content-Type': 'application/json',
+                   'Prefer': 'resolution=merge-duplicates,return=minimal'}
+        # Supabase sb_secret_* keys are opaque API keys, not JWTs.
+        # Sending them as Bearer tokens can cause 'Invalid JWT'.
+        # Legacy service_role JWTs still support the Authorization header.
+        if not self.key.startswith(('sb_secret_', 'sb_publishable_')):
+            headers['Authorization'] = f'Bearer {self.key}'
+        return headers
 
     def load(self, owner='personal'):
         try:
