@@ -124,7 +124,10 @@ if "_data_loaded" not in S:
             data=validate_restore({"schema":2,**data})
         for k,v in (data or DEFAULT_STATE).items():
             if k in DATA_KEYS: S[k]=copy.deepcopy(v)
+        # Widget state must reflect the cloud record, not a previous view's default.
         S._data_loaded=True
+        S.project_picker=S.get("current", "My channel")
+        S._cloud_loaded_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     except (StorageError, ValueError) as e:
         storage_problem=str(e)
         # Never silently replace stored data if storage is unavailable.
@@ -136,13 +139,44 @@ if S.current not in S.projects: S.current=next(iter(S.projects))
 for k, v in {"script":"", "script_title":"", "review":"", "selected_topic":"",
              "page":"studio", "studio_recipe":"reels_script", "studio_output":"",
              "studio_output_type":"", "studio_group":"All", "results":[],
-             "_pending_nav":None, "_last_save_error":""}.items():
+             "_pending_nav":None, "_last_save_error":"", "_flash_message":""}.items():
     if k not in S: S[k]=v
 
 def save_state():
-    if not store: raise StorageError(storage_problem or 'Storage not configured')
+    """Persist complete user state, and never claim success on a failed write."""
+    if not store:
+        raise StorageError(storage_problem or 'Storage not configured')
     store.save(persistent_state())
     S._last_save_error = ""
+
+def reload_from_storage():
+    """Explicit authoritative re-read; never overwrite cloud data with empty defaults."""
+    if not store:
+        raise StorageError(storage_problem or 'Storage not configured')
+    raw=store.load()
+    if raw is None:
+        raise StorageError('No saved cloud record was found. Local changes were left intact.')
+    loaded=validate_restore({'schema':2, **raw})
+    for key in DATA_KEYS:
+        S[key]=copy.deepcopy(loaded.get(key, DEFAULT_STATE[key]))
+    if not S.projects:
+        raise StorageError('Saved project list is empty.')
+    if S.current not in S.projects:
+        S.current=next(iter(S.projects))
+    # The selectbox already exists during this run: defer its update until the next rerun.
+    S._pending_project=S.current
+    for key in list(S):
+        # Clear per-project widgets: they must not replay older profile values
+        # and overwrite the freshly restored cloud snapshot.
+        if isinstance(key,str) and (key.startswith('profile_') or key.startswith('topic_') or key.startswith('status_')):
+            del S[key]
+    S._saved_digest=hashlib.sha256(json.dumps(persistent_state(),ensure_ascii=False,sort_keys=True).encode()).hexdigest()
+    S._cloud_loaded_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    S._last_save_error=''
+
+def profile_key(field):
+    # Scope Streamlit widgets to the active project.
+    return 'profile_'+hashlib.sha256(S.current.encode('utf-8')).hexdigest()[:12]+'_'+field
 
 def navigate(destination):
     # Synchronise the sidebar widget on the NEXT run rather than overwriting its value.
@@ -181,7 +215,8 @@ def make_prompt(kind: str, subject: str, extra: str = "") -> tuple[str,str]:
             f"output_language={'Russian' if S.language_output == 'RU' else 'English'}. "
             "Avoid factual claims without evidence, guarantees of virality, and copied wording from competitor videos. "
             "Create original, executable material. For factual content, highlight what must be verified. "
-            "Produce all headings and explanations in the output language; generation prompts in English. "
+            "Produce all headings and explanations in the output language. "
+            f"Production prompts must be written in {'Russian' if S.prompt_language == 'RU' else 'English'}. "
             "Never claim features or metrics not shown as available in the supplied facts.")
     if kind == "script":
         system = "You are a meticulous short-video producer and storyboard writer. " + base
@@ -216,11 +251,20 @@ with st.sidebar:
     S.ui_lang = st.segmented_control("Language / Язык", ["RU", "EN"], default="RU", key="language_ui")
     names = list(S.projects)
     idx = names.index(S.current) if S.current in names else 0
+    if S.get('project_picker') not in names:
+        S.project_picker=S.current
     if S.get("_pending_project"):
         S.project_picker=S._pending_project
         S._pending_project=None
     chosen = st.selectbox(tr("Проект", "Project"), names, index=idx, key="project_picker")
     if chosen != S.current:
+        # Save any edits to the outgoing project before switching views.
+        try:
+            save_state()
+        except StorageError as exc:
+            S._last_save_error=str(exc)
+            st.error('Project change not saved / Не удалось сохранить проект: '+str(exc))
+            st.stop()
         S.current = chosen
         S.language_output=S.projects[chosen].get("output_language","EN")
         S.prompt_language=S.projects[chosen].get("prompt_language","EN")
@@ -268,6 +312,8 @@ with st.sidebar:
         st.warning(tr("Локальное сохранение: на Streamlit Community Cloud данные могут исчезнуть после перезапуска сервера. Для надёжного хранения подключи Supabase.",
                       "Local storage: Streamlit Cloud can discard this data on redeploy/restart. Connect Supabase for durability."))
     if S._last_save_error: st.error(tr("Сохранение не удалось: ", "Save failed: ")+S._last_save_error)
+    if S.get('_flash_message'):
+        st.success(S.pop('_flash_message'))
     st.caption(tr("Демонстрационный кабинет · без регистрации и оплаты", "Prototype workspace · no sign-up or payments"))
 
 p = S.projects[S.current]
@@ -439,8 +485,8 @@ if S.page == "studio":
         if S.studio_output_type=="draft":
             st.info(tr("Это шаблонный черновик без AI-генерации и без проверки трендов.", "This is a rule-based draft, not an AI generation or trend report."))
         else:
-            st.caption(tr("Результат Gemini. Проверь факты, даты и пригодность сценария перед публикацией.",
-                          "Gemini output. Verify claims, dates and production details before publishing."))
+            st.caption(tr("Результат AI. Проверь факты, даты и пригодность сценария перед публикацией.",
+                          "AI output. Verify claims, dates and production details before publishing."))
         with st.container(border=True):
             st.markdown(S.studio_output)
         exports_ui(S.studio_output,selected.slug,(idea_text.strip() or p["niche"])[:90],"studio_export")
@@ -484,18 +530,19 @@ elif S.page == "profile":
             S.language_output=S.projects[name]["output_language"]
             S.prompt_language=S.projects[name]["prompt_language"]
             S._pending_project=name
-            st.toast(tr("Проект создан. Заполни его анкету.", "Project created. Fill out its profile."))
+            S._flash_message=tr("Проект создан и выбран. Теперь заполни его отдельную анкету.",
+                                "Project created and selected. Fill out its separate profile.")
             navigate("profile")
     a,b=st.columns(2)
     with a:
-        p["niche"] = st.text_input(tr("Ниша", "Niche"), value=p["niche"])
-        p["audience"] = st.text_area(tr("Кто смотрит", "Target audience"), value=p["audience"], height=90)
-        p["tone"] = st.text_area(tr("Манера речи и стиль", "Tone of voice"), value=p["tone"], height=90)
-        p["handle"] = st.text_input(tr("Ссылка на канал (для справки)", "Channel URL (reference only)"),value=p.get("handle",""))
+        p["niche"] = st.text_input(tr("Ниша", "Niche"), value=p["niche"],key=profile_key('niche'))
+        p["audience"] = st.text_area(tr("Кто смотрит", "Target audience"), value=p["audience"], height=90,key=profile_key('audience'))
+        p["tone"] = st.text_area(tr("Манера речи и стиль", "Tone of voice"), value=p["tone"], height=90,key=profile_key('tone'))
+        p["handle"] = st.text_input(tr("Ссылка на канал (для справки)", "Channel URL (reference only)"),value=p.get("handle",""),key=profile_key('handle'))
     with b:
-        p["platform"] = st.selectbox(tr("Главная платформа", "Main platform"),["YouTube Shorts","Instagram Reels","TikTok","Telegram","Pinterest"],index=["YouTube Shorts","Instagram Reels","TikTok","Telegram","Pinterest"].index(p["platform"]) if p["platform"] in ["YouTube Shorts","Instagram Reels","TikTok","Telegram","Pinterest"] else 0)
-        p["goal"] = st.text_input(tr("Цель", "Goal"),value=p["goal"])
-        p["duration"] = st.slider(tr("Длина видео (сек)", "Video duration (sec)"),min_value=12,max_value=60,value=int(p["duration"]))
+        p["platform"] = st.selectbox(tr("Главная платформа", "Main platform"),["YouTube Shorts","Instagram Reels","TikTok","Telegram","Pinterest"],index=["YouTube Shorts","Instagram Reels","TikTok","Telegram","Pinterest"].index(p["platform"]) if p["platform"] in ["YouTube Shorts","Instagram Reels","TikTok","Telegram","Pinterest"] else 0,key=profile_key('platform'))
+        p["goal"] = st.text_input(tr("Цель", "Goal"),value=p["goal"],key=profile_key('goal'))
+        p["duration"] = st.slider(tr("Длина видео (сек)", "Video duration (sec)"),min_value=12,max_value=60,value=int(p["duration"]),key=profile_key('duration'))
     st.caption(tr("Изменения автосохраняются в подключённом хранилище; надёжность зависит от выбранного способа хранения.",
                   "Changes auto-save to the configured store; durability depends on its backend."))
 
@@ -554,7 +601,9 @@ elif S.page == "scripts":
     header("03 / SCRIPT LAB",tr("Сценарист и 5 хуков", "Script lab & 5 hooks"),tr("Короткие, точные кадры, таймкоды и промпты для видео.", "Compact scenes, timing and prompts for AI-video tools."))
     topic=st.text_input(tr("Тема ролика", "Video topic"),value=S.selected_topic or "How a chicken egg forms")
     extra=st.text_area(tr("Дополнительные пожелания", "Extra instructions"),placeholder=tr("Реалистично, научно точно, без повторов...", "Realistic, scientifically accurate, no repeated shots..."),height=90)
-    st.subheader(tr("Пять вариантов начала", "Five alternative hooks"))
+    st.subheader(tr("Пять черновых начал (без AI)", "Five draft hooks (without AI)"))
+    st.caption(tr("Это шаблонные подсказки. Для содержательных хуков по фактам используй генерацию AI и проверь результат.",
+                  "These are editable sketches. For subject-specific, factual hooks use AI generation and verify its claims."))
     hooks=sample_hooks(topic,p["niche"],S.ui_lang)
     for i,(kind,h) in enumerate(hooks):
         st.markdown(f'<div class="v-card" style="min-height:40px;padding:13px 18px;margin:7px 0"><span class="v-tag">{i+1:02} · {safe_html(kind)}</span> {safe_html(h)}</div>',unsafe_allow_html=True)
@@ -720,11 +769,38 @@ elif S.page == "metrics":
         st.subheader(tr("Управление записями", "Manage records"))
         for i,v in enumerate(S.videos):
             if v.get("project")!=S.current: continue
-            x,y=st.columns([5,1])
-            x.write(f"{v.get('title','')} · {v.get('views',0)} views")
-            if y.button(tr("Удалить", "Delete"),key=f"metric_del_{i}"):
-                S.videos.pop(i)
-                navigate("metrics")
+            with st.expander(f"{v.get('title','')} · {v.get('views',0)} views", expanded=False):
+                with st.form(f'metric_edit_{i}'):
+                    new_title=st.text_input(tr('Название', 'Title'),value=v.get('title',''),key=f'metric_title_{i}')
+                    new_link=st.text_input(tr('Ссылка', 'Link'),value=v.get('url',''),key=f'metric_link_{i}')
+                    cols=st.columns(4)
+                    numbers={}
+                    for col,key_name,label_ru,label_en in zip(cols,('views','likes','comments','saves'),
+                          ('Просмотры','Лайки','Комментарии','Сохранения'),('Views','Likes','Comments','Saves')):
+                        with col:
+                            numbers[key_name]=st.number_input(tr(label_ru,label_en),min_value=0,
+                                        value=int(v.get(key_name,0)),key=f'metric_{key_name}_{i}')
+                    if st.form_submit_button(tr('Сохранить изменения', 'Save changes')):
+                        if not new_title.strip():
+                            st.error(tr('Название обязательно.', 'Title is required.'))
+                        else:
+                            v.update({'title':new_title.strip(),'url':new_link.strip(),
+                                      **{k:int(x) for k,x in numbers.items()},
+                                      'updated':datetime.now().isoformat(timespec='seconds')})
+                            try:
+                                save_state()
+                                S._flash_message=tr('Изменения сохранены.', 'Changes saved.')
+                                navigate('metrics')
+                            except StorageError as e:
+                                st.error(tr('Ошибка сохранения: ', 'Save error: ')+str(e))
+                if st.button(tr('Удалить запись', 'Delete record'),key=f'metric_del_{i}'):
+                    S.videos.pop(i)
+                    try:
+                        save_state()
+                        S._flash_message=tr('Запись удалена.', 'Record deleted.')
+                        navigate('metrics')
+                    except StorageError as e:
+                        st.error(tr('Ошибка сохранения: ', 'Save error: ')+str(e))
 
 elif S.page == "team":
     header("08 / WORKSPACE",tr("Команда проекта", "Project team"),tr("Подготовка ролей продюсера, автора и монтажёра.", "Track producer, creator and editor roles."))
@@ -739,7 +815,28 @@ elif S.page == "team":
 elif S.page == "settings":
     header("09 / DATA & PRIVACY",tr("Настройки и экспорт", "Settings & export"),tr("Сохрани свои проекты в файл, чтобы не потерять данные между сессиями.", "Export your projects so that they survive browser sessions."))
     if store and store.remote:
-        st.success(tr("Подключено постоянное облачное хранилище Supabase.", "Persistent Supabase cloud storage connected."))
+        st.success(tr("Supabase настроен. Проверить фактическое чтение можно ниже.",
+                      "Supabase configured. Verify actual reads below."))
+        if st.button(tr('Проверить облачные данные', 'Verify cloud data'),key='cloud_verify'):
+            try:
+                cloud=store.load()
+                if cloud is None:
+                    st.warning(tr('В облаке пока нет записи.', 'No cloud record yet.'))
+                else:
+                    cloud=validate_restore({'schema':2,**cloud})
+                    st.success(tr('Прочитано из Supabase: ', 'Read from Supabase: ')+
+                               ', '.join(cloud['projects']))
+                    st.write(tr('Активный проект в базе: ', 'Active project in database: ')+str(cloud['current']))
+            except (StorageError,ValueError,TypeError,KeyError) as e:
+                st.error(tr('Ошибка чтения: ', 'Read error: ')+str(e))
+        if st.button(tr('Загрузить сохранённые проекты из облака', 'Reload saved projects from cloud'),
+                     key='cloud_reload'):
+            try:
+                reload_from_storage()
+                S._flash_message=tr('Проекты загружены из Supabase.', 'Projects reloaded from Supabase.')
+                st.rerun()
+            except (StorageError,ValueError,TypeError,KeyError) as e:
+                st.error(tr('Не удалось загрузить: ', 'Reload failed: ')+str(e))
     else:
         st.warning(tr("Работает локальная база SQLite. На Streamlit Cloud она может исчезнуть при перезапуске сервера или обновлении. Подключи Supabase по README для постоянного хранения.",
                       "Local SQLite mode: Streamlit Cloud can reset it on redeploy or server restart. Configure Supabase for durability."))
@@ -749,7 +846,7 @@ elif S.page == "settings":
     if f and st.button(tr("Восстановить данные", "Restore data")):
         try:
             content=json.load(f)
-            assert content.get("schema")==1 and isinstance(content.get("projects"),dict) and content["projects"]
+            assert content.get("schema") in (1,2) and isinstance(content.get("projects"),dict) and content["projects"]
             restored=validate_restore(content)
             for k,v in restored.items(): S[k]=v
             S.current=S.current if S.current in S.projects else next(iter(S.projects))
