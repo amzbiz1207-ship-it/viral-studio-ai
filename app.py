@@ -6,6 +6,13 @@ import hashlib
 import re
 import os
 import hmac
+import base64
+import io
+import requests
+import subprocess
+import tempfile
+import shutil
+from PIL import Image
 from html import escape as safe_html
 from datetime import datetime
 from pathlib import Path
@@ -137,9 +144,11 @@ for k,v in DEFAULT_STATE.items():
     if k not in S: S[k]=copy.deepcopy(v)
 if S.current not in S.projects: S.current=next(iter(S.projects))
 for k, v in {"script":"", "script_title":"", "review":"", "selected_topic":"",
-             "page":"studio", "studio_recipe":"reels_script", "studio_output":"",
+             "page":"studio", "studio_recipe":None, "studio_output":"",
              "studio_output_type":"", "studio_group":"All", "results":[],
-             "_pending_nav":None, "_last_save_error":"", "_flash_message":""}.items():
+             "_pending_nav":None, "_last_save_error":"", "_flash_message":"",
+             "review_original":"", "review_adaptation":"", "review_evidence":"",
+             "review_idea_choice":1, "review_source_url":""}.items():
     if k not in S: S[k]=v
 
 def save_state():
@@ -247,7 +256,7 @@ with st.sidebar:
     if st.button("🔒 Выйти / Sign out", key="private_logout"):
         st.session_state["_viral_authenticated"] = False
         st.rerun()
-    st.caption("Independent creator workspace · MVP 3.0")
+    st.caption("Independent creator workspace · Personal 1.0")
     S.ui_lang = st.segmented_control("Language / Язык", ["RU", "EN"], default="RU", key="language_ui")
     names = list(S.projects)
     idx = names.index(S.current) if S.current in names else 0
@@ -256,7 +265,7 @@ with st.sidebar:
     if S.get("_pending_project"):
         S.project_picker=S._pending_project
         S._pending_project=None
-    chosen = st.selectbox(tr("Проект", "Project"), names, index=idx, key="project_picker")
+    chosen = st.selectbox(tr("Проект", "Project"), names, key="project_picker")
     if chosen != S.current:
         # Save any edits to the outgoing project before switching views.
         try:
@@ -271,7 +280,8 @@ with st.sidebar:
         # Clear transient creative work so content from another project cannot appear here.
         for transient in ("results", "script", "script_title", "review", "selected_topic",
                           "studio_output", "studio_output_type", "last_video", "review_url",
-                          "review_url_input", "studio_idea", "transcript"):
+                          "review_url_input", "studio_idea", "transcript", "review_original",
+                          "review_adaptation", "review_evidence", "review_source_url"):
             S.pop(transient, None)
         S.results = []
         S.script = ""
@@ -345,7 +355,8 @@ def add_library(kind: str, title: str, body: str, url: str = ""):
     item={"type":kind, "title":title, "content":body, "url":url,
           "project":S.current, "added":datetime.now().strftime("%Y-%m-%d %H:%M")}
     if any(x.get("project")==S.current and x.get("type")==kind and
-           (x.get("url") and x.get("url")==url or x.get("content")==body) for x in S.library):
+           ((kind=='youtube' and bool(url) and x.get('url')==url) or x.get("content")==body)
+           for x in S.library):
         st.info(tr("Материал уже сохранён — дубликат не создан.", "Already saved; no duplicate created."))
         return
     S.library.append(item)
@@ -368,7 +379,7 @@ def generate_ai(system, prompt):
         try: return gemini_generate(S.gemini_key,S.gemini_model,system,prompt)
         except ApiError as e:
             errors.append(str(e))
-            if provider == "Gemini" or ('503' not in str(e) and 'UNAVAILABLE' not in str(e)):
+            if provider == "Gemini" or (not any(k in str(e).upper() for k in ('503', '504', 'UNAVAILABLE', 'DEADLINE_EXCEEDED', 'TIMEOUT', 'TIMED OUT'))):
                 raise
     if provider != "Gemini" and S.get("deepseek_key"):
         try: return deepseek_generate(S.deepseek_key,system,prompt)
@@ -376,13 +387,138 @@ def generate_ai(system, prompt):
     raise ApiError('; '.join(errors) or tr("Подключи API-ключ выбранной нейросети.", "Connect an API key for the selected provider."))
 
 
+
+def _vision_images(uploaded_files) -> list[dict]:
+    """Convert selected screenshots to capped JPEGs; never persist originals or credentials."""
+    images=[]
+    for file in list(uploaded_files or [])[:8]:
+        try:
+            with Image.open(io.BytesIO(file.getvalue())) as source:
+                frame=source.convert('RGB')
+                frame.thumbnail((1280,1280))
+                output=io.BytesIO()
+                frame.save(output,format='JPEG',quality=78,optimize=True)
+            data=base64.b64encode(output.getvalue()).decode('ascii')
+            images.append({'type':'image_url','image_url':{'url':'data:image/jpeg;base64,'+data, 'detail':'auto'}})
+        except (OSError, ValueError) as exc:
+            raise ApiError('Не удалось прочитать один из кадров / Cannot read one uploaded frame.') from exc
+    return images
+
+
+class _PreparedFrame:
+    """Small in-memory frame with the uploader's getvalue() protocol."""
+    def __init__(self, raw: bytes):
+        self._raw=raw
+    def getvalue(self):
+        return self._raw
+
+
+def _frames_from_uploaded_video(video_file):
+    """Extract a small, evenly spaced visual sample if ffmpeg is available.
+
+    This is NOT full video/transcript understanding. Uploaded video bytes
+    are handled in a temporary directory and not written to Supabase.
+    """
+    if video_file is None:
+        return []
+    if not shutil.which('ffmpeg'):
+        raise ApiError('Автоизвлечение кадров недоступно на сервере (нет ffmpeg). '
+                       'Добавь 4–8 скриншотов ролика вручную.')
+    data=video_file.getvalue()
+    if not data or len(data)>60*1024*1024:
+        raise ApiError('Загрузи MP4/MOV до 60 МБ или используй скриншоты.')
+    with tempfile.TemporaryDirectory(prefix='viral_video_') as folder:
+        suffix='.mov' if video_file.name.lower().endswith('.mov') else '.mp4'
+        source=Path(folder)/('source'+suffix)
+        source.write_bytes(data)
+        # FPS=1/8 produces up to 8 frames spanning the first 64 seconds.
+        target=str(Path(folder)/'frame_%02d.jpg')
+        try:
+            result=subprocess.run(['ffmpeg','-hide_banner','-loglevel','error',
+              '-i',str(source),'-vf','fps=1/8,scale=960:-2','-frames:v','8',
+              '-q:v','4','-y',target], capture_output=True,text=True,timeout=35,check=False)
+        except (OSError,subprocess.TimeoutExpired) as exc:
+            raise ApiError('Не удалось извлечь кадры из видео; используй скриншоты.') from exc
+        if result.returncode != 0:
+            raise ApiError('Видео не распознано или формат не поддерживается; используй скриншоты.')
+        shots=sorted(Path(folder).glob('frame_*.jpg'))
+        if not shots:
+            raise ApiError('Не удалось найти кадры в видео; используй скриншоты.')
+        return [_PreparedFrame(x.read_bytes()) for x in shots]
+
+
+def analyze_with_frames(system: str, prompt: str, uploaded_files) -> str:
+    """DeepSeek Flash vision API, actual uploaded frames only. A YouTube URL is not video footage."""
+    if not S.get('deepseek_key'):
+        raise ApiError('Для анализа кадров нужен DeepSeek API key / DeepSeek key needed for frame analysis.')
+    frames=_vision_images(uploaded_files)
+    if not frames:
+        return generate_ai(system,prompt)
+    message=[{'type':'text','text':prompt + '\nThese uploaded frames are evidence of the video. Their order is the upload order. Do not infer unseen motion, dialogue, edits or exact frame timestamps.'}] + frames
+    try:
+        response=requests.post('https://api.deepseek.com/chat/completions',
+           headers={'Authorization':f"Bearer {S.deepseek_key}", 'Content-Type':'application/json'},
+           json={'model':'deepseek-flash','messages':[{'role':'system','content':system},
+                  {'role':'user','content':message}], 'temperature':0.55,'stream':False}, timeout=90)
+        if not response.ok:
+            error_text=(response.json().get('error') or {}).get('message','API error') if 'json' in response.headers.get('Content-Type','').lower() else f'HTTP {response.status_code}'
+            raise ApiError(f'DeepSeek Vision HTTP {response.status_code}: {str(error_text)[:160]}')
+        answer=response.json()['choices'][0]['message']['content']
+        if not answer: raise ApiError('DeepSeek did not return an analysis.')
+        return str(answer).strip()
+    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
+        raise ApiError(f'DeepSeek Vision request failed: {str(exc)[:160]}') from exc
+
+
+def analysis_prompts(metadata: str, transcript: str, frame_count: int) -> tuple[str,str]:
+    lang='Russian' if S.language_output=='RU' else 'English'
+    system=(f'You are a careful video editor and creator. Write analysis in {lang}, production prompts in English. '
+      'Use only supplied YouTube metadata, user scene notes and actual uploaded still frames. '
+      'Separate OBSERVED from INFERRED and UNKNOWN. Never claim to have viewed the entire original video '
+      'from a YouTube URL. Do not invent a transcript, editing cuts, music or retention metrics. '
+      'Never reproduce a competitor video or their dialogue. Provide practical original, production-ready ideas. '
+      f'Current date: {datetime.now().date().isoformat()}.')
+    prompt=(f'SOURCE METADATA: {metadata}\nSCENE NOTES OR TRANSCRIPT: {transcript or "NOT PROVIDED"}\n'
+      f'UPLOADED KEY FRAMES COUNT: {frame_count}.\n'
+      'Deliver a useful, detailed source analysis with sections: (1) FACTS and statistics, (2) OBSERVED STORYBOARD '
+      'as a numbered scene table with times ONLY when timing is actually provided, else mark approximate/unknown, '
+      '(3) possible opening hook and pacing: observed vs hypothesized, (4) evidence-based reasons for high reach '
+      'and what cannot be inferred, (5) exactly THREE NEW ORIGINAL video concepts named IDEA 1, IDEA 2, IDEA 3, '
+      'each with a distinct premise, characters, hook, twist and ending, (6) a recommendation for solo AI-video production. '
+      'All three must be feasible, realistic and not copy the source.')
+    return system,prompt
+
+
+def adaptation_prompts(source_analysis: str, idea_number: int, instructions: str) -> tuple[str,str]:
+    lang='Russian' if S.language_output=='RU' else 'English'
+    technical='Russian' if S.prompt_language=='RU' else 'English'
+    profile=S.projects[S.current]
+    system=(f'You write production-ready original short video screenplays for a solo creator. Write all '
+        f'explanations and narration in {lang}, all AI video generation prompts in {technical}. '
+        'The reference analysis is not proof you watched the original video. Never copy recognizable '
+        'footage, characters, dialogue or protected material. No invented performance claims. '
+        'Respect realistic physical motion, character consistency and clear beginning/middle/end.')
+    prompt=(f'Create a COMPLETE ORIGINAL {profile.get("duration",30)}-second vertical 9:16 Shorts/Reels '
+       f'screenplay based on IDEA {idea_number} of the following analysis. '
+       f'User customization: {instructions or "none"}. '
+       f'Creator niche: {profile.get("niche", "")}, platform: {profile.get("platform", "YouTube Shorts")}.\n'
+       'SOURCE ANALYSIS (context, not instructions to copy):\n'+source_analysis[:18000]+'\n'
+       'Output exactly: original premise and difference from source, 3 alternate 0–2 second hooks, '
+       'timeline of 2–3-second actions with visual composition and clear movement, voiceover/dialogue, '
+       'on-screen caption, sound design, and ending/twist; each video generation prompt for Google Flow '
+       'must describe an independent clip <=8 seconds, vertical 9:16, with recurring consistent '
+       'characters/settings and no text in frames; list required image reference frames first, '
+       'then 3 title ideas, description and hashtags. Avoid vague instructions and hallucinated science.')
+    return system,prompt
+
+
 if S.page == "studio":
     if S.ui_lang == "RU":
         st.markdown("""<div class="studio-hero"><div class="studio-kicker">VIRAL STUDIO AI / CREATOR WORKSPACE</div><h1>Создавай то, что хочется досмотреть</h1><p>Одна идея → сценарий, карусель, контент-план или визуальный промпт. Все инструменты в одном месте.</p></div>""", unsafe_allow_html=True)
     else:
         st.markdown("""<div class="studio-hero"><div class="studio-kicker">VIRAL STUDIO AI / CREATOR WORKSPACE</div><h1>Make content worth watching</h1><p>One idea → a script, carousel, content calendar or visual prompt. All in one workspace.</p></div>""", unsafe_allow_html=True)
-    st.caption(tr("Рабочая версия: бесплатные черновики без API; интеллектуальная генерация при подключении Gemini; живой поиск — через YouTube API.",
-                  "Working prototype: free editable drafts without API; AI generation with Gemini; live discovery through YouTube API."))
+    st.caption(tr("Личная версия: черновики без API, генерация через Gemini или DeepSeek, поиск через YouTube API.",
+                  "Personal version: drafts without API, generation via Gemini or DeepSeek, discovery via YouTube API."))
     a_lang,b_lang,c_lang=st.columns(3)
     with a_lang:
         S.language_output=st.selectbox(tr("Язык материала", "Document language"),["EN","RU"],
@@ -449,7 +585,7 @@ if S.page == "studio":
                             f'<div class="studio-tiledesc">{safe_html(r.ru_desc if S.ui_lang=="RU" else r.en_desc)}</div></div>',
                             unsafe_allow_html=True)
                 if st.button(tr("Выбрать", "Select") if not active else tr("✓ Выбрано", "✓ Selected"),
-                             key="recipe_"+r.slug, use_container_width=True, disabled=active):
+                             key="recipe_"+r.slug, use_container_width=True):
                     if r.kind=="navigate":
                         S.page=r.route
                     else:
@@ -457,24 +593,33 @@ if S.page == "studio":
                         S.studio_output=""
                     navigate(S.page)
 
-    selected=CATALOG.get(S.studio_recipe,CATALOG["reels_script"])
+    selected=CATALOG.get(S.studio_recipe)
     st.divider()
-    st.subheader(tr("Мастерская: ", "Workshop: ") + recipe_title(selected.slug,S.ui_lang))
-    st.caption(selected.ru_desc if S.ui_lang=="RU" else selected.en_desc)
-    st.info(tr("Выбери инструмент, напиши задание выше и нажми «Создать с AI» ниже.",
-               "Select a tool, write your request above, then click Generate with AI below."))
+    if selected:
+        st.subheader(tr("Мастерская: ", "Workshop: ") + recipe_title(selected.slug,S.ui_lang))
+    if selected:
+        st.caption(selected.ru_desc if S.ui_lang=="RU" else selected.en_desc)
+    if not selected:
+        st.info(tr("Сначала введи задачу и нажми «Выбрать» под нужным инструментом.",
+                   "Write your request, then click Select on the tool you want."))
     if not idea_text.strip():
         st.info(tr("Напиши идею в поле вверху. Можно использовать тему канала, если конкретная идея ещё не готова.",
                    "Enter an idea above. Your channel niche can be used as a starting point."))
     gen_a,gen_b=st.columns(2)
     with gen_a:
-        if st.button(tr("Создать бесплатный черновик", "Create free draft"), use_container_width=True):
-            S.studio_output=fallback_draft(selected.slug,idea_text or p["niche"],p,S.ui_lang)
-            S.studio_output_type="draft"
+        if st.button(tr("Создать бесплатный черновик", "Create free draft"), use_container_width=True, disabled=not bool(selected)):
+            if not selected:
+                st.warning(tr("Сначала выбери инструмент.", "Select a tool first."))
+            else:
+                S.studio_output=fallback_draft(selected.slug,idea_text or p["niche"],p,S.ui_lang)
+                S.studio_output_type="draft"
     with gen_b:
-        generated_from_bottom=st.button(tr("✨ Создать с AI", "✨ Generate with AI"),type="primary",use_container_width=True)
+        generated_from_bottom=False
+        st.caption(tr("Для AI-генерации используй одну основную кнопку наверху.", "Use the single Generate with AI button above."))
         if generated_from_bottom or bool(S.pop("_generate_from_top",False)):
-            if not (S.gemini_key or S.get("deepseek_key")):
+            if not selected:
+                st.warning(tr("Сначала выбери инструмент под его карточкой.", "Select a tool card first."))
+            elif not (S.gemini_key or S.get("deepseek_key")):
                 st.warning(tr("Добавь Gemini или DeepSeek API key слева.", "Connect Gemini or DeepSeek API key in the sidebar."))
             else:
                 sys_msg,prompt=ai_prompts(selected.slug,idea_text or p["niche"],p,S.language_output)
@@ -487,7 +632,7 @@ if S.page == "studio":
                         add_library(selected.slug,(idea_text.strip() or p["niche"])[:90],S.studio_output)
                 except ApiError as e:
                     st.error(str(e))
-    if S.studio_output:
+    if S.studio_output and selected:
         if S.studio_output_type=="draft":
             st.info(tr("Это шаблонный черновик без AI-генерации и без проверки трендов.", "This is a rule-based draft, not an AI generation or trend report."))
         else:
@@ -520,7 +665,7 @@ elif S.page == "dashboard":
             S.selected_topic=quick
             navigate("scripts")
     with right:
-        st.markdown(f'<div class="v-card"><h3>{tr("Что действительно работает в этой версии", "What works in this version")}</h3><p>✓ {tr("Анкета, план, шаблоны и библиотека", "Profiles, plans, templates and library")}</p><p>✓ {tr("Настоящие данные YouTube при наличии API-ключа", "Real YouTube data when API is connected")}</p><p>✓ {tr("AI-сценарии при наличии Gemini API", "AI scripts when Gemini API is connected")}</p></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="v-card"><h3>{tr("Что действительно работает в этой версии", "What works in this version")}</h3><p>✓ {tr("Анкета, план, шаблоны и библиотека", "Profiles, plans, templates and library")}</p><p>✓ {tr("Настоящие данные YouTube при наличии API-ключа", "Real YouTube data when API is connected")}</p><p>✓ {tr("AI-сценарии через Gemini или DeepSeek", "AI scripts using Gemini or DeepSeek")}</p></div>', unsafe_allow_html=True)
         st.info(tr("Автопубликация, анализ Instagram/TikTok, многопользовательский доступ и генерация видео пока не подключены.", "Auto-posting, Instagram/TikTok analytics, multiuser access and video generation are not integrated yet."))
 
 elif S.page == "profile":
@@ -578,7 +723,11 @@ elif S.page == "trends":
                 with st.spinner(tr("Получаем данные YouTube...", "Fetching YouTube data...")):
                     S.results=search_youtube(query,S.youtube_key,days=days,language=language,
                                              min_views=min_views,short_only=short_only)
-            except ApiError as e: st.error(str(e))
+            except ApiError as e:
+                st.error(tr('Поиск не выполнен: ', 'Search failed: ')+str(e))
+                S._youtube_search_failed=True
+            else:
+                S._youtube_search_failed=False
     if S.results:
         st.caption(tr("Сортировка: средние просмотры в день (примерная оценка на основе даты публикации).", "Sorted by estimated views per day since publication."))
         results=sorted(S.results,key=lambda x:x["views_per_day"],reverse=True)
@@ -594,12 +743,15 @@ elif S.page == "trends":
                     st.link_button(tr("Открыть ролик", "Open video"),v["url"])
                     if st.button(tr("Анализировать →", "Analyze →"),key="analyze_"+v["id"]):
                         S.review_url=v["url"]
+                        S.pop('review_url_input',None)
                         S.last_video=v
+                        S.review=''; S.review_original=''; S.review_adaptation=''
+                        S.review_source_url=''
                         navigate("review")
                     if st.button(tr("Сохранить в библиотеку", "Save to library"),key="save_"+v["id"]):
                         add_library("youtube",v["title"],f"Channel: {v['channel']}. Views: {v['views']}. Published: {v['published']}.",v["url"])
                         st.toast(tr("Добавлено", "Saved"))
-    else:
+    elif not S.get('_youtube_search_failed',False):
         st.info(tr("Подходящие видео пока не найдены. Уменьши порог просмотров, расширь период или уточни запрос.",
                    "No matching videos. Lower minimum views, widen dates, or refine the topic."))
 
@@ -620,7 +772,7 @@ elif S.page == "scripts":
             S.script_title=topic
             add_library("script",topic,S.script)
     with b:
-        if st.button(tr("✨ Сгенерировать сценарий с Gemini", "✨ Generate with Gemini"),type="primary",use_container_width=True):
+        if st.button(tr("✨ Сгенерировать сценарий с AI", "✨ Generate with AI"),type="primary",use_container_width=True):
             try:
                 with st.spinner(tr("Создаём сценарий...", "Generating script...")):
                     S.script=run_ai("script",topic,extra)
@@ -645,7 +797,7 @@ elif S.page == "week":
                 S.pop(f"status_{S.current}_{i}", None)
             p["week"]=demo_week(p["niche"],S.ui_lang)
     with b:
-        if st.button(tr("✨ План недели с Gemini", "✨ Create AI week plan"),type="primary",use_container_width=True):
+        if st.button(tr("✨ План недели с AI", "✨ Create AI week plan"),type="primary",use_container_width=True):
             try:
                 with st.spinner(tr("Составляем план...", "Planning...")):
                     raw=run_ai("week",p["niche"])
@@ -679,54 +831,131 @@ elif S.page == "week":
         st.progress(done/7,text=tr(f"Опубликовано {done} из 7",f"Published {done} of 7"))
 
 elif S.page == "review":
-    header("05 / VIDEO DECONSTRUCTION",tr("Разбор чужого ролика", "Video link analysis"),tr("Отделяем измеренные показатели от гипотез — без выдуманной транскрибации.", "We separate measured metrics from hypotheses and never invent a transcript."))
-    url=st.text_input(tr("Ссылка YouTube Shorts, Reels или TikTok", "YouTube Shorts, Reels or TikTok URL"),
-                      value=S.get("review_url", ""),placeholder="https://www.youtube.com/shorts/...........",key="review_url_input")
-    transcript=st.text_area(tr("Транскрибация / описание кадров (необязательно)", "Transcript / visual notes (optional)"),height=135,placeholder=tr("Вставь текст речи или свои заметки по кадрам", "Paste spoken dialogue or your own frame notes"))
+    header('05 / CREATIVE DECONSTRUCTION',
+           tr('Анализ → 3 идеи → свой сценарий', 'Analyze → 3 ideas → original script'),
+           tr('От реальных данных и кадров к готовой раскадровке и промптам.',
+              'From real evidence and selected frames to your own complete storyboard.'))
+    st.info(tr('YouTube API показывает статистику, но не передаёт само видео для просмотра. '
+               'Для визуального анализа добавь ключевые кадры (скриншоты) или описание сцен. '
+               'DeepSeek Flash сможет изучить загруженные кадры.',
+               'YouTube API supplies metadata, not actual video footage. Upload key frames or scene notes '
+               'for a visual analysis with DeepSeek Flash.'))
+    url=st.text_input(tr('Ссылка на видео', 'Video link'),
+        value=S.get('review_url',''), placeholder='https://www.youtube.com/shorts/...',key='review_url_input')
     vid=youtube_id(url) if url else None
-    if S.get("review_url_input") != S.get("review_url"):
+    if S.get('review_url_input') != S.get('review_url'):
         S.review_url=S.review_url_input
-        if S.get("last_video") and S.last_video.get("id")!=vid:
+        if S.get('review_source_url') != url:
+            S.review=''; S.review_original=''; S.review_adaptation=''; S.review_evidence=''
+        if S.get('last_video') and S.last_video.get('id')!=vid:
             S.last_video=None
-            S.review=""
     if url and not vid:
-        st.warning(tr("Автоматическая статистика сейчас доступна только для YouTube. Можно анализировать вручную вставленный текст других платформ.", "Automatic statistics currently support YouTube only. You can still analyze your own pasted text from other platforms."))
-    if st.button(tr("Получить факты о видео", "Get video facts")):
-        if not vid: st.warning(tr("Укажи корректную ссылку YouTube.", "Enter a valid YouTube video link."))
-        elif not S.youtube_key: st.warning(tr("Добавь YouTube API key слева.", "Add a YouTube API key on the left."))
+        st.caption(tr('Для других платформ можно использовать свои кадры и описание; статистика YouTube недоступна.',
+                      'For other platforms, use your own frames and notes; YouTube metrics are unavailable.'))
+    transcript=st.text_area(tr('Текст речи / описание сцен и их время (необязательно)',
+                               'Transcript / scene descriptions and timing (optional)'),
+        placeholder=tr('Например: 0–2 с: кот тянется к тарелке; 2–5 с: собака замечает...','e.g. 0–2s: cat reaches for plate; 2–5s: dog notices...'),
+        height=120,key='review_transcript')
+    frames=st.file_uploader(tr('Ключевые кадры видео (до 8 PNG/JPG/WebP)',
+                               'Key video frames (up to 8 PNG/JPG/WebP)'),
+                            type=['png','jpg','jpeg','webp'],accept_multiple_files=True,key='review_frames')
+    video_upload=st.file_uploader(tr('Или загрузи видео MP4/MOV (до 60 МБ; при наличии ffmpeg)',
+                                      'Or upload MP4/MOV (up to 60 MB, if ffmpeg is installed)'),
+                                  type=['mp4','mov'],key='review_video_upload')
+    if video_upload:
+        st.caption(tr('Из видео будет взято до 8 кадров с интервалом примерно 8 секунд. '
+                      'Аудио и промежуточные движения не анализируются; для точности добавь описание сцен.',
+                      'Up to 8 still frames roughly 8 seconds apart. Audio and motion between frames '
+                      'are not examined; add scene notes for detail.'))
+    if frames and len(frames)>8:
+        st.warning(tr('Будут рассмотрены первые 8 кадров.', 'Only the first 8 frames will be used.'))
+    if frames:
+        st.caption(tr(f'Добавлено кадров: {min(len(frames),8)}. Порядок загрузки = порядок сцен. Кадры не записываются в Supabase.',
+                      f'{min(len(frames),8)} frames. Upload order is scene order. Images are not stored in Supabase.'))
+    if st.button(tr('Получить статистику YouTube', 'Get YouTube facts'),key='review_facts'):
+        if not vid: st.warning(tr('Укажи YouTube-ссылку.', 'Enter a YouTube link.'))
+        elif not S.youtube_key: st.warning(tr('Добавь YouTube API key в Secrets.', 'Add YouTube API key in Secrets.'))
         else:
             try:
                 S.last_video=get_youtube_video(vid,S.youtube_key)
-                if not S.last_video: st.warning(tr("Видео не найдено или недоступно.", "Video not found or unavailable."))
-            except ApiError as e: st.error(str(e))
-    if S.get("last_video") and S.last_video.get("id")==vid:
-        v=S.last_video
-        st.markdown(f"**{v['title']}** · {v['channel']}")
-        a,b,c=st.columns(3)
-        a.metric(tr("Просмотры", "Views"),format_num(v["views"]))
-        b.metric(tr("Лайки", "Likes"),format_num(v["likes"]) if v["likes"] is not None else "—")
-        c.metric(tr("В день (оценка)", "Per day (estimate)"),format_num(v["views_per_day"]))
-    if st.button(tr("✨ Получить факты и анализировать", "✨ Fetch facts and analyze"),type="primary"):
-        if vid and S.youtube_key and not (S.get("last_video") or {}).get("id")==vid:
+                if not S.last_video: st.warning(tr('Видео не найдено.', 'Video not found.'))
+            except ApiError as err: st.error(str(err))
+    video=S.get('last_video') if vid and (S.get('last_video') or {}).get('id')==vid else None
+    if video:
+        st.markdown(f"**{video.get('title','')}** · {video.get('channel','')}")
+        m1,m2,m3=st.columns(3)
+        m1.metric(tr('Просмотры','Views'),format_num(video.get('views',0)))
+        m2.metric(tr('Лайки','Likes'),format_num(video['likes']) if video.get('likes') is not None else '—')
+        m3.metric(tr('В день (среднее)','Avg/day'),format_num(video.get('views_per_day',0)))
+    metadata=(f'URL: {url}; title: {video.get("title", "")}; description: {video.get("description", "")}; '
+              f'views: {video.get("views", "unknown")}; likes: {video.get("likes", "unknown")}; '
+              f'published: {video.get("published", "unknown")}; duration_s: {video.get("duration_s", "unknown")}; '
+              f'channel: {video.get("channel", "unknown")}' if video else f'URL: {url}; source metadata unavailable')
+    st.subheader(tr('Шаг 1. Разобрать ролик и получить три новые идеи',
+                    'Step 1. Analyze the source and get three new ideas'))
+    if st.button(tr('✨ Анализировать и предложить 3 идеи', '✨ Analyze and suggest 3 ideas'),
+                 type='primary',key='review_deep_analyze',use_container_width=True):
+        if not (url.strip() or transcript.strip() or frames or video_upload):
+            st.warning(tr('Добавь ссылку, описание или кадры.', 'Provide a link, scene notes, or frames.'))
+        else:
             try:
-                S.last_video=get_youtube_video(vid,S.youtube_key)
-            except ApiError as err: st.warning(str(err))
-        video = S.get("last_video") if vid and (S.get("last_video") or {}).get("id")==vid else None
-        metadata=(f"URL: {url}. Video title: {video.get('title','')}. Description: {video.get('description','')}. "
-                  f"Views: {video.get('views','not known')}. Likes: {video.get('likes','not known')}. "
-                  f"Published: {video.get('published','not known')}. Duration: {video.get('duration_s','not known')} seconds. "
-                  f"Channel: {video.get('channel','not known')}." if video else f"URL: {url}. Metadata unavailable")
-        try:
-            with st.spinner(tr("Анализируем доступные данные...", "Analyzing available evidence...")):
-                S.review=run_ai("review",metadata,f"User-supplied transcript/scene notes: {transcript or 'NOT PROVIDED'}")
-                add_library("analysis",url or "Video analysis",S.review,url)
-        except ApiError as e: st.error(str(e))
-    if S.review:
-        st.markdown(S.review)
-        exports_ui(S.review,"Analysis",url or "Video", "review_export")
-        if st.button(tr("Сохранить разбор", "Save analysis")):
-            add_library("analysis",url or "Video analysis",S.review,url)
-            st.toast(tr("Сохранено", "Saved"))
+                # Re-fetch source only if needed; a failed metadata fetch never fabricates source facts.
+                if vid and S.youtube_key and video is None:
+                    try:
+                        S.last_video=get_youtube_video(vid,S.youtube_key)
+                        video=S.last_video
+                        if video:
+                            metadata=(f'URL: {url}; title: {video.get("title", "")}; description: {video.get("description", "")}; '
+                                f'views: {video.get("views", "unknown")}; likes: {video.get("likes", "unknown")}; '
+                                f'published: {video.get("published", "unknown")}; duration_s: {video.get("duration_s", "unknown")}; '
+                                f'channel: {video.get("channel", "unknown")}')
+                    except ApiError as fetch_err:
+                        st.warning(tr('Статистика недоступна: ', 'Metadata unavailable: ')+str(fetch_err))
+                input_frames=list(frames or [])[:8]
+                if video_upload and not input_frames:
+                    input_frames=_frames_from_uploaded_video(video_upload)
+                system,prompt=analysis_prompts(metadata,transcript,len(input_frames))
+                with st.spinner(tr('Анализируем факты, кадры и предлагаем идеи...',
+                                   'Analyzing evidence and building original ideas...')):
+                    generated=analyze_with_frames(system,prompt,input_frames) if input_frames else generate_ai(system,prompt)
+                S.review=generated; S.review_original=generated
+                S.review_adaptation=''
+                S.pop('review_idea_choice',None)
+                S.review_source_url=url
+                S.review_evidence='frames' if input_frames else ('notes' if transcript.strip() else 'metadata')
+                add_library('analysis',((video or {}).get('title') or url or 'Video analysis')[:90],generated,url)
+            except ApiError as err: st.error(str(err))
+    if S.get('review_original') and S.get('review_source_url')==url:
+        st.success(tr('Анализ готов. Выбери идею и получи собственный сценарий.',
+                      'Analysis ready. Choose an idea to create an original script.'))
+        with st.expander(tr('Показать полный анализ и три идеи', 'Full analysis and three ideas'), expanded=True):
+            st.markdown(S.review_original)
+        exports_ui(S.review_original,'Analysis',((video or {}).get('title') or 'Video')[:70],'deep_review_export')
+        st.subheader(tr('Шаг 2. Выбери оригинальную идею', 'Step 2. Pick an original concept'))
+        idea=st.radio(tr('Идея из анализа', 'Concept from analysis'),[1,2,3],horizontal=True,
+                      format_func=lambda x:tr(f'Идея {x}',f'Idea {x}'),key='review_idea_choice')
+        custom=st.text_area(tr('Что изменить в будущем сценарии?', 'Customize your script'),
+             placeholder=tr('Например: домашний юмор, бабушка и кот, неожиданный финал, 9:16, без фантастики.',
+                            'E.g. realistic domestic humor, a grandmother and a cat, unexpected ending, 9:16.'),
+             key='review_custom_idea',height=90)
+        if st.button(tr('🎬 Создать МОЙ сценарий с раскадровкой',
+                        '🎬 Create MY script and storyboard'),type='primary',
+                        key='review_make_script',use_container_width=True):
+            system,prompt=adaptation_prompts(S.review_original,idea,custom)
+            try:
+                with st.spinner(tr('Создаём оригинальную историю, тайминг и промпты...',
+                                   'Creating your original storyline and shot prompts...')):
+                    text=generate_ai(system,prompt)
+                S.review_adaptation=text
+                title=(f'Original idea {idea} · '+((video or {}).get('title') or 'Shorts'))[:90]
+                add_library('original_script',title,text,url)
+            except ApiError as err: st.error(str(err))
+    if S.get('review_adaptation') and S.get('review_source_url')==url:
+        st.subheader(tr('Шаг 3. Твой готовый сценарий', 'Step 3. Your finished original script'))
+        st.markdown(S.review_adaptation)
+        exports_ui(S.review_adaptation,'Original_Script',f'Idea_{S.review_idea_choice}_Shorts','review_adapt_export')
+        st.caption(tr('Сценарий сохранён в библиотеку этого проекта.',
+                      'The original script is saved in this project library.'))
 
 elif S.page == "library":
     header("06 / CREATIVE VAULT",tr("Библиотека идей", "Saved content library"),tr("Сценарии и интересные ролики не теряются в переписке.", "Keep scripts, links and ideas together."))
@@ -737,6 +966,17 @@ elif S.page == "library":
         with st.expander(f"{item['type'].upper()} · {item['title']} · {item['added']}"):
             if item.get("url"): st.link_button(tr("Открыть источник", "Open source"),item["url"])
             st.markdown(item["content"])
+            if item.get('type')=='analysis':
+                if st.button(tr('🎬 Продолжить: выбрать идею и создать сценарий',
+                                '🎬 Continue: select an idea and generate script'),key=f'continue_{i}'):
+                    S.review_url=item.get('url','')
+                    S.pop('review_url_input',None)
+                    S.review_original=item.get('content','')
+                    S.review=item.get('content','')
+                    S.review_source_url=item.get('url','')
+                    S.review_adaptation=''
+                    S.review_idea_choice=1
+                    navigate('review')
             exports_ui(item["content"],item["type"],item["title"],f"library_{i}")
             if st.button(tr("Удалить", "Delete"),key=f"delete_{i}"):
                 S.library.pop(i); navigate("library")
