@@ -100,6 +100,11 @@ def get_youtube_video(video_id: str, key: str) -> dict | None:
 
 
 def gemini_generate(api_key: str, model: str, instruction: str, user_prompt: str) -> str:
+    """Generate once with a bounded network wait; report API errors to the UI.
+
+    The original implementation had no explicit request timeout and retried
+    503 errors, which could keep the Streamlit spinner running for minutes.
+    """
     if not api_key:
         raise ApiError("A Gemini API key is required.")
     try:
@@ -107,25 +112,33 @@ def gemini_generate(api_key: str, model: str, instruction: str, user_prompt: str
         from google.genai import types
     except ImportError as exc:
         raise ApiError("The google-genai package is not installed. Install requirements.txt.") from exc
-    import time
-    for attempt in range(2):
-        try:
-            with genai.Client(api_key=api_key) as client:
-                response = client.models.generate_content(
-                    model=model,contents=user_prompt,
-                    config=types.GenerateContentConfig(system_instruction=instruction, temperature=0.65),
-                )
-            if not response.text:
-                raise ApiError('The model returned no text. Please try again.')
-            return response.text.strip()
-        except ApiError:
-            raise
-        except Exception as exc:
-            error=str(exc)
-            if attempt == 0 and ('503' in error or 'UNAVAILABLE' in error):
-                time.sleep(1.5)
-                continue
-            raise ApiError(f'Gemini API error: {error[:250]}') from exc
+    try:
+        with genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                timeout=45_000,  # SDK timeout is in milliseconds.
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
+        ) as client:
+            response = client.models.generate_content(
+                model=model,
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=instruction,
+                    temperature=0.65,
+                ),
+            )
+        if not response.text:
+            raise ApiError('Gemini returned no text. Please try again.')
+        return response.text.strip()
+    except ApiError:
+        raise
+    except Exception as exc:
+        error = str(exc)
+        if 'timed out' in error.lower() or 'timeout' in error.lower():
+            raise ApiError('Gemini request timed out after 45 seconds. Please try again.') from exc
+        # Never include credentials or full request headers in an error.
+        raise ApiError(f'Gemini API error: {error[:250]}') from exc
 
 
 def deepseek_generate(api_key: str, instruction: str, user_prompt: str, model: str = 'deepseek-chat') -> str:
