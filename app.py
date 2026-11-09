@@ -268,8 +268,14 @@ with st.sidebar:
         S.current = chosen
         S.language_output=S.projects[chosen].get("output_language","EN")
         S.prompt_language=S.projects[chosen].get("prompt_language","EN")
+        # Clear transient creative work so content from another project cannot appear here.
+        for transient in ("results", "script", "script_title", "review", "selected_topic",
+                          "studio_output", "studio_output_type", "last_video", "review_url",
+                          "review_url_input", "studio_idea", "transcript"):
+            S.pop(transient, None)
         S.results = []
         S.script = ""
+        S.studio_output = ""
         navigate(S.page)
     menu = [
         ("studio",tr("✨ AI-студия и шаблоны", "✨ AI studio & templates")),
@@ -402,7 +408,7 @@ if S.page == "studio":
             else:
                 S._generate_from_top=True
     with b:
-        if st.button(tr("Подобрать инструмент (не создаёт)", "Suggest a tool (no generation)"), use_container_width=True):
+        if st.button(tr("Подобрать инструмент", "Suggest a tool"), use_container_width=True):
             if not idea_text.strip():
                 st.warning(tr("Сначала напиши идею в поле выше.", "Start by entering your idea above."))
             else:
@@ -475,7 +481,7 @@ if S.page == "studio":
                 sys_msg += (" Technical generator prompts must be in " + ("Russian" if S.prompt_language=="RU" else "English") + ". ")
                 sys_msg += " Only deliver the selected tool's output, do not append unrelated formats or scripts. "
                 try:
-                    with st.spinner(tr("Готовим результат с Gemini…", "Creating with Gemini…")):
+                    with st.spinner(tr("Готовим результат с AI…", "Creating with AI…")):
                         S.studio_output=generate_ai(sys_msg,prompt)
                         S.studio_output_type="ai"
                         add_library(selected.slug,(idea_text.strip() or p["niche"])[:90],S.studio_output)
@@ -848,13 +854,29 @@ elif S.page == "settings":
             content=json.load(f)
             assert content.get("schema") in (1,2) and isinstance(content.get("projects"),dict) and content["projects"]
             restored=validate_restore(content)
-            for k,v in restored.items(): S[k]=v
-            S.current=S.current if S.current in S.projects else next(iter(S.projects))
+            # Apply the fully validated backup, then invalidate stale form widgets.
+            # Without clearing them, old on-screen values can silently overwrite restored data.
+            previous = persistent_state()
+            try:
+                for k,v in restored.items(): S[k]=copy.deepcopy(v)
+                S.current=S.current if S.current in S.projects else next(iter(S.projects))
+                save_state()
+            except StorageError:
+                for k,v in previous.items(): S[k]=v
+                raise
+            for k in list(S):
+                if isinstance(k,str) and (k.startswith('profile_') or
+                        k.startswith('topic_') or k.startswith('status_')):
+                    del S[k]
             S._pending_project=S.current
             S.results=[]
-            save_state()
-            st.success(tr("Данные восстановлены", "Backup restored"))
+            S.studio_output=""
+            S.script=""
+            S._flash_message=tr("Резервная копия восстановлена.", "Backup restored.")
             navigate("settings")
+        except StorageError as e:
+            st.error(tr("Не удалось сохранить восстановленные данные: ",
+                        "Could not save restored data: ")+str(e))
         except (ValueError,AssertionError,TypeError,KeyError) as e:
             st.error(tr("Некорректный файл резервной копии.", "Invalid backup file."))
     st.subheader(tr("Что подключим дальше", "Future integrations"))
