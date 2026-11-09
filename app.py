@@ -148,7 +148,9 @@ for k, v in {"script":"", "script_title":"", "review":"", "selected_topic":"",
              "studio_output_type":"", "studio_group":"All", "results":[],
              "_pending_nav":None, "_last_save_error":"", "_flash_message":"",
              "review_original":"", "review_adaptation":"", "review_evidence":"",
-             "review_idea_choice":1, "review_source_url":""}.items():
+             "review_idea_choice":1, "review_source_url":"",
+             "story_source":"", "story_ideas":"", "story_script":"",
+             "story_style":"family", "story_draft_source":"", "story_style_for_ideas":"family"}.items():
     if k not in S: S[k]=v
 
 def save_state():
@@ -209,12 +211,46 @@ def exports_ui(content, kind, subject, key):
             if ext=='pdf': blob=pdf_bytes(subject,content)
             with c:
                 st.download_button(label,blob,file_name=filename(kind,subject,ext),mime=mime,
-                                   key=f"{key}_{ext}",use_container_width=True)
+                                   key=f"{key}_{ext}",width='stretch')
         except Exception as e:
             with c: st.warning(f"{label}: {e}")
 
 def tr(ru: str, en: str) -> str:
     return ru if S.ui_lang == "RU" else en
+
+
+def creative_director_rules() -> str:
+    """Production brief used by every final short-video script path.
+
+    This is prompt guidance, NOT a claim that retention analytics or source
+    footage can be inferred from public YouTube metadata.
+    """
+    return (
+        "CREATIVE DIRECTOR / HOOK & STORY OPTIMIZER — REQUIRED FOR EVERY FINAL SHORT: "
+        "First identify the core audience emotion, curiosity gap, comic mechanism, "
+        "and most compelling observable action or reaction. The first 0–3 seconds "
+        "must be a SPECIFIC visual event, not an introduction, title card, background "
+        "explanation, generic question or slow establishing shot. Design THREE genuinely "
+        "different opening options: (A) show a consequence or something visibly wrong, "
+        "(B) interrupt an ordinary action with a plausible surprise, (C) tease the "
+        "reaction/payoff without revealing its cause. Specify an exact visual, action, "
+        "sound and viewer curiosity for each; recommend ONE and explain why for THIS "
+        "story (do not claim guaranteed virality). Build a tight cause-and-effect beat "
+        "sequence: hook, escalation, reveal/payoff, brief natural reaction, clean ending. "
+        "Consider a reverse-order cold open or a callback ONLY if it makes the short "
+        "clearer. Remove filler, repeated shots, excessive narration, artificial calls "
+        "to action and implausible acting. Prefer humor that is visually understandable "
+        "even with sound off and feels candid, warm and surprising to adults. "
+        "Deliver production-ready timed scenes with one feasible physical action per "
+        "clip, clear continuity and consistent appearance/location. Add ready-to-copy "
+        "standalone image/video generation prompts (each clip no longer than 8 seconds), "
+        "sound/edit notes and a compact realism/safety self-check. If this script is "
+        "inspired by a reference analysis, reuse ONLY general narrative principles, "
+        "not distinctive source footage, jokes, dialogue, characters or sequence. "
+        "Evidence rules: without actual video frames/transcript, NEVER assert which "
+        "specific source frame made the video popular, its retention curve, or an "
+        "observed hook. Label such claims as hypotheses. "
+    )
 
 
 def make_prompt(kind: str, subject: str, extra: str = "") -> tuple[str,str]:
@@ -228,9 +264,9 @@ def make_prompt(kind: str, subject: str, extra: str = "") -> tuple[str,str]:
             f"Production prompts must be written in {'Russian' if S.prompt_language == 'RU' else 'English'}. "
             "Never claim features or metrics not shown as available in the supplied facts.")
     if kind == "script":
-        system = "You are a meticulous short-video producer and storyboard writer. " + base
+        system = "You are a meticulous short-video producer and storyboard writer. " + base + creative_director_rules()
         prompt = (f"Create a {p['duration']}-second script for this topic: {subject}. "
-                  "Output: 5 distinct hook options (question, surprising fact, scene, mistake, specific promise), "
+                  "Output: three contrasting concrete 0–3-second visual hook options, identify the strongest, "
                   "then a tight timestamped scene-by-scene storyboard (every 2-5 seconds), visuals, "
                   "voiceover, on-screen captions, final CTA, and precise ENGLISH production prompts "
                   "for vertical 9:16 AI-video tools such as Flow/Kling. "
@@ -281,7 +317,11 @@ with st.sidebar:
         for transient in ("results", "script", "script_title", "review", "selected_topic",
                           "studio_output", "studio_output_type", "last_video", "review_url",
                           "review_url_input", "studio_idea", "transcript", "review_original",
-                          "review_adaptation", "review_evidence", "review_source_url"):
+                          "review_adaptation", "review_adaptation_idea", "review_evidence", "review_source_url",
+                          "story_source", "story_ideas", "story_script", "story_draft_source",
+                          "story_source_input", "story_guidance", "story_script_custom", "story_script_idea",
+                          "story_style_picker", "story_idea_choice", "story_style_for_ideas",
+                          "story_reference_picker", "story_reference_marker"):
             S.pop(transient, None)
         S.results = []
         S.script = ""
@@ -295,6 +335,7 @@ with st.sidebar:
         ("scripts",tr("✍️ Сценарии и хуки", "✍️ Scripts & hooks")),
         ("week",tr("🗓️ План на неделю", "🗓️ Weekly plan")),
         ("review",tr("🔍 Разбор по ссылке", "🔍 Analyze a link")),
+        ("story",tr("📖 История → готовый ролик", "📖 Story → ready-to-film video")),
         ("library",tr("📚 Библиотека", "📚 Library")),
         ("metrics",tr("📈 Мои результаты", "📈 My results")),
         ("team",tr("👥 Команда", "👥 Team")),
@@ -353,12 +394,16 @@ def header(kicker: str, title: str, caption: str):
 
 def add_library(kind: str, title: str, body: str, url: str = ""):
     item={"type":kind, "title":title, "content":body, "url":url,
-          "project":S.current, "added":datetime.now().strftime("%Y-%m-%d %H:%M")}
+          "project":S.current, "added":datetime.now().strftime("%Y-%m-%d %H:%M"),
+          "creative_style":(S.get("story_style_picker","family") if kind=="story_ideas" else S.get("review_style","animals") if kind in ("analysis","original_script") else "")}
     if any(x.get("project")==S.current and x.get("type")==kind and
            ((kind=='youtube' and bool(url) and x.get('url')==url) or x.get("content")==body)
            for x in S.library):
         st.info(tr("Материал уже сохранён — дубликат не создан.", "Already saved; no duplicate created."))
         return
+    if kind == "story_ideas":
+        item["source_story"] = S.get("story_draft_source", "")
+        item["reference_marker"] = S.get("story_reference_marker", "")
     S.library.append(item)
     try:
         save_state()
@@ -382,7 +427,7 @@ def generate_ai(system, prompt):
             if provider == "Gemini" or (not any(k in str(e).upper() for k in ('503', '504', 'UNAVAILABLE', 'DEADLINE_EXCEEDED', 'TIMEOUT', 'TIMED OUT'))):
                 raise
     if provider != "Gemini" and S.get("deepseek_key"):
-        try: return deepseek_generate(S.deepseek_key,system,prompt)
+        try: return _deepseek_flash(system,prompt,effort='none')
         except ApiError as e: errors.append(str(e))
     raise ApiError('; '.join(errors) or tr("Подключи API-ключ выбранной нейросети.", "Connect an API key for the selected provider."))
 
@@ -459,7 +504,7 @@ def analyze_with_frames(system: str, prompt: str, uploaded_files) -> str:
         response=requests.post('https://api.deepseek.com/chat/completions',
            headers={'Authorization':f"Bearer {S.deepseek_key}", 'Content-Type':'application/json'},
            json={'model':'deepseek-flash','messages':[{'role':'system','content':system},
-                  {'role':'user','content':message}], 'temperature':0.55,'stream':False}, timeout=90)
+                  {'role':'user','content':message}], 'temperature':0.55,'stream':False,'reasoning_effort':'low', 'max_tokens':3400}, timeout=(12,100))
         if not response.ok:
             error_text=(response.json().get('error') or {}).get('message','API error') if 'json' in response.headers.get('Content-Type','').lower() else f'HTTP {response.status_code}'
             raise ApiError(f'DeepSeek Vision HTTP {response.status_code}: {str(error_text)[:160]}')
@@ -470,26 +515,94 @@ def analyze_with_frames(system: str, prompt: str, uploaded_files) -> str:
         raise ApiError(f'DeepSeek Vision request failed: {str(exc)[:160]}') from exc
 
 
-def analysis_prompts(metadata: str, transcript: str, frame_count: int) -> tuple[str,str]:
+CONTENT_STYLES = {
+    "animals": "Realistic Animal Comedy",
+    "family": "Real-Life Family Comedy — entirely fictional children",
+}
+
+def _creative_rules(style: str) -> str:
+    """Rules for ORIGINAL ideas, not a reason to distort analysis of source footage."""
+    common = (
+        "ORIGINAL CONCEPT SAFETY AND REALISM: Plausible everyday situations, natural lighting, "
+        "candid smartphone/home-camera appearance, real-world physics, one simple location, "
+        "one escalating surprise and one clear punchline. Broad adult appeal, also family-safe. "
+        "No dangerous falls, intimidation, distress as entertainment, humiliating pranks, "
+        "dangerous stunts, or injury. Never reuse competitor footage, unique dialogue or characters. "
+        "For photorealistic AI scenes, remind the publisher to comply with synthetic-media disclosure rules. "
+    )
+    if style == "family":
+        return common + (
+            "STYLE: entirely fictional AI children with no resemblance to real or identifiable children. "
+            "Kind, candid, age-appropriate household comedy involving natural reactions and everyday surprises. "
+            "Small children are supervised and safe; no unsafe infant sleep setup, loose covers on sleeping "
+            "infants, risky handling or frightening pranks. If spoken language is comedically advanced for "
+            "the child's age, frame it as clearly staged fictional comedy rather than actual footage. "
+            "No demeaning jokes, adult subject matter, or child impersonation. "
+            "If the target audience is English-speaking, invent dialogue in natural contemporary "
+            "English. Use only idioms or double meanings that genuinely exist in English and are "
+            "naturally spoken in the scene; do not translate Russian sayings or wordplay literally. "
+            "A misunderstanding must follow a believable child's interpretation, not a forced pun. "
+            "No toilet jokes unless the creator explicitly requests them, and avoid childish slapstick."
+        )
+    return common + (
+        "STYLE: photorealistic ordinary cats/dogs and natural pet behavior; accurate anatomy, weight, "
+        "paw motion and reaction timing. No clothes, speech, human careers, cartoon behavior, magic "
+        "or implausible intentional human-like plotting. Humor should come from harmless pet mishaps, "
+        "misdirection, reaction and visual reversal. Never frighten or endanger the animals."
+    )
+
+
+def _deepseek_flash(system: str, prompt: str, *, effort: str = 'none', timeout: int = 80) -> str:
+    """Bounded DeepSeek Flash call; no hidden unlimited auto-retries."""
+    key=S.get('deepseek_key')
+    if not key:
+        raise ApiError('DeepSeek API key is missing.')
+    payload={'model':'deepseek-flash',
+        'messages':[{'role':'system','content':system}, {'role':'user','content':prompt}],
+        'stream':False, 'reasoning_effort':effort,
+        'temperature':0.6, 'max_tokens':3400}
+    try:
+        response=requests.post('https://api.deepseek.com/chat/completions',
+            headers={'Authorization':f'Bearer {key}','Content-Type':'application/json'},
+            json=payload, timeout=(12,timeout))
+        if not response.ok:
+            try: detail=(response.json().get('error') or {}).get('message','')
+            except ValueError: detail=''
+            raise ApiError(f'DeepSeek HTTP {response.status_code}: {str(detail)[:170]}')
+        answer=response.json()['choices'][0]['message']['content']
+        if not isinstance(answer,str) or not answer.strip():
+            raise ApiError('DeepSeek returned no text. Try again with a shorter task.')
+        return answer.strip()
+    except requests.Timeout as exc:
+        raise ApiError('DeepSeek did not respond in time. The request was stopped; try fewer frames or a shorter task.') from exc
+    except requests.RequestException as exc:
+        raise ApiError(f'DeepSeek connection error: {str(exc)[:130]}') from exc
+    except (ValueError,KeyError,IndexError,TypeError) as exc:
+        raise ApiError('DeepSeek response could not be read. Please try once more.') from exc
+
+
+def analysis_prompts(metadata: str, transcript: str, frame_count: int, style: str = "animals") -> tuple[str,str]:
     lang='Russian' if S.language_output=='RU' else 'English'
     system=(f'You are a careful video editor and creator. Write analysis in {lang}, production prompts in English. '
       'Use only supplied YouTube metadata, user scene notes and actual uploaded still frames. '
       'Separate OBSERVED from INFERRED and UNKNOWN. Never claim to have viewed the entire original video '
       'from a YouTube URL. Do not invent a transcript, editing cuts, music or retention metrics. '
       'Never reproduce a competitor video or their dialogue. Provide practical original, production-ready ideas. '
+      'For ORIGINAL ideas only, obey: '+_creative_rules(style)+' '
       f'Current date: {datetime.now().date().isoformat()}.')
     prompt=(f'SOURCE METADATA: {metadata}\nSCENE NOTES OR TRANSCRIPT: {transcript or "NOT PROVIDED"}\n'
       f'UPLOADED KEY FRAMES COUNT: {frame_count}.\n'
       'Deliver a useful, detailed source analysis with sections: (1) FACTS and statistics, (2) OBSERVED STORYBOARD '
       'as a numbered scene table with times ONLY when timing is actually provided, else mark approximate/unknown, '
       '(3) possible opening hook and pacing: observed vs hypothesized, (4) evidence-based reasons for high reach '
-      'and what cannot be inferred, (5) exactly THREE NEW ORIGINAL video concepts named IDEA 1, IDEA 2, IDEA 3, '
+      'and what cannot be inferred, (4b) a compact REUSABLE CREATIVE BLUEPRINT: curiosity gap, comic mechanism, hook archetype and payoff pattern — mark any unobserved parts HYPOTHESIS, (5) exactly THREE NEW ORIGINAL video concepts named IDEA 1, IDEA 2, IDEA 3, '
       'each with a distinct premise, characters, hook, twist and ending, (6) a recommendation for solo AI-video production. '
-      'All three must be feasible, realistic and not copy the source.')
+      'All three must fit the SELECTED creative style and be safe, feasible, realistic and not copy the source. '
+      'Keep the total answer focused (roughly 650–1000 words) so the creator can act on it.')
     return system,prompt
 
 
-def adaptation_prompts(source_analysis: str, idea_number: int, instructions: str) -> tuple[str,str]:
+def adaptation_prompts(source_analysis: str, idea_number: int, instructions: str, style: str = "animals") -> tuple[str,str]:
     lang='Russian' if S.language_output=='RU' else 'English'
     technical='Russian' if S.prompt_language=='RU' else 'English'
     profile=S.projects[S.current]
@@ -497,7 +610,8 @@ def adaptation_prompts(source_analysis: str, idea_number: int, instructions: str
         f'explanations and narration in {lang}, all AI video generation prompts in {technical}. '
         'The reference analysis is not proof you watched the original video. Never copy recognizable '
         'footage, characters, dialogue or protected material. No invented performance claims. '
-        'Respect realistic physical motion, character consistency and clear beginning/middle/end.')
+        'Respect realistic physical motion, character consistency and clear beginning/middle/end. '
+        +_creative_rules(style)+creative_director_rules())
     prompt=(f'Create a COMPLETE ORIGINAL {profile.get("duration",30)}-second vertical 9:16 Shorts/Reels '
        f'screenplay based on IDEA {idea_number} of the following analysis. '
        f'User customization: {instructions or "none"}. '
@@ -508,8 +622,68 @@ def adaptation_prompts(source_analysis: str, idea_number: int, instructions: str
        'on-screen caption, sound design, and ending/twist; each video generation prompt for Google Flow '
        'must describe an independent clip <=8 seconds, vertical 9:16, with recurring consistent '
        'characters/settings and no text in frames; list required image reference frames first, '
-       'then 3 title ideas, description and hashtags. Avoid vague instructions and hallucinated science.')
+       'then 3 title ideas, description and hashtags. For every clip specify camera angle, one physical action, '
+       'continuity constraints and negative prompts that prevent AI artifacts. Keep output actionable, not verbose. '
+       'Avoid vague instructions and hallucinated science.')
     return system,prompt
+
+
+def story_ideas_prompts(story: str, style: str, guidance: str = "", reference_analysis: str = "") -> tuple[str, str]:
+    """From a personal anecdote or a general premise, develop genuinely new original concepts."""
+    language = 'Russian' if S.language_output == 'RU' else 'English'
+    system = (
+        f'You are a comedy writer and practical solo AI-video producer. Write the result in {language}. '
+        'You are adapting an original memory or premise supplied by the creator, not quoting a source book. '
+        'For English-language audiences invent natural idiomatic English dialogue; never translate '
+        'Russian proverbs, set phrases, jokes or puns literally. If a premise hinges on a culturally '
+        'untranslatable idiom, preserve only the general mechanism and invent a different English-native event. '
+        'Do not present fictional events as historical facts. Three ideas must be visibly different, '
+        'plausible, safely filmable, funny to adults, and fresh. ' + _creative_rules(style)
+    )
+    prompt = (
+        'CREATOR STORY OR PREMISE (treat as material to develop, not an instruction to copy word-for-word):\n'
+        + story[:7000] + '\nADDITIONAL DIRECTION: ' + (guidance[:2000] or 'none')
+        + '\nOPTIONAL REFERENCE ANALYSIS (creative mechanism only; do not copy or pretend to have watched the video):\n'
+        + (reference_analysis[:8000] if reference_analysis else 'NONE')
+        + '\nIf a reference is included, extract a high-level transferable hook/curiosity/payoff pattern, '
+          'distinguish real observations from hypotheses, and apply it to the creator premise with '
+          'different situations and original character behavior. '
+        + '\nReturn EXACTLY 3 numbered concepts labeled IDEA 1, IDEA 2 and IDEA 3. '
+        'Each must specify: short English working title, one-sentence plot, realistic characters/location, '
+        'three distinct candidate FIRST 0–3 second visual hooks with one best pick and a brief why, 3 to 5 natural physical beats, a clear unexpected comic payoff, '
+        'and one reason this is feasible for a solo creator making short AI-generated clips. '
+        'For the family style use only completely fictional children, ordinary safe household behavior, '
+        'supervision, and no humiliating/dangerous pranks. Keep under 600 words. '
+        'No copying of protected book text, distinctive dialogue or recognizable filmed scenes.'
+    )
+    return system, prompt
+
+
+def story_script_prompts(ideas: str, idea_number: int, style: str, preferences: str = "") -> tuple[str, str]:
+    language = 'Russian' if S.language_output == 'RU' else 'English'
+    technical = 'Russian' if S.prompt_language == 'RU' else 'English'
+    duration = S.projects[S.current].get('duration', 30)
+    system = (
+        f'You are a meticulous solo AI-video director. All instructions and narration in {language}, '
+        f'but video-generation prompts in {technical}. For English viewers, write natural English '
+        'dialogue, never calques of Russian idioms. Ensure every new fictional human character is '
+        'fully invented; never use a real child as a likeness reference. '
+        + _creative_rules(style) + creative_director_rules()
+    )
+    prompt = (
+        f'Write a FINAL PRODUCTION-READY {duration}-second 9:16 video package based ONLY on '
+        f'IDEA {idea_number} from these concepts:\n{ideas[:13000]}\n'
+        f'Creator adjustments: {preferences[:2000] or "none"}.\n'
+        'Deliver: (1) 3 original hook alternatives, (2) complete numbered shot table with exact '
+        'start/end times totaling requested duration, physical action, framing and continuity, '
+        '(3) brief dialogue or narration (if any), sound design and final comic payoff, '
+        '(4) ready-to-copy English prompts for each independent <=8-second Google Flow/Kling clip: '
+        'consistent character appearance, one action per clip, location/light/camera, natural physics, '
+        'negative artifacts; no baked-in text, (5) optional on-screen captions, titles, description '
+        'and tags, (6) a safety/plausibility checklist. Do NOT require extra story development '
+        'by the creator and do NOT invent a source video or imagined observed footage.'
+    )
+    return system, prompt
 
 
 if S.page == "studio":
@@ -537,14 +711,14 @@ if S.page == "studio":
                             height=110)
     a,b,c,d=st.columns([1.6,1.3,1.0,1.0])
     with a:
-        if st.button(tr("✨ Создать с AI", "✨ Generate with AI"),type="primary",use_container_width=True,key="generate_top"):
+        if st.button(tr("✨ Создать с AI", "✨ Generate with AI"),type="primary",width='stretch',key="generate_top"):
             if not idea_text.strip():
                 st.warning(tr("Напиши задание выше, затем нажми «Создать с AI».",
                               "Write a request above before generating."))
             else:
                 S._generate_from_top=True
     with b:
-        if st.button(tr("Подобрать инструмент", "Suggest a tool"), use_container_width=True):
+        if st.button(tr("Подобрать инструмент", "Suggest a tool"), width='stretch'):
             if not idea_text.strip():
                 st.warning(tr("Сначала напиши идею в поле выше.", "Start by entering your idea above."))
             else:
@@ -557,10 +731,10 @@ if S.page == "studio":
                     S.studio_recipe = chosen
                 navigate(S.page)
     with c:
-        if st.button(tr("🔍 Найти видео", "🔍 Discover"), use_container_width=True):
+        if st.button(tr("🔍 Найти видео", "🔍 Discover"), width='stretch'):
             navigate("trends")
     with d:
-        if st.button(tr("📅 План недели", "📅 Weekly plan"), use_container_width=True):
+        if st.button(tr("📅 План недели", "📅 Weekly plan"), width='stretch'):
             navigate("week")
 
     st.markdown("### " + tr("Выбери инструмент", "Explore tools"))
@@ -585,7 +759,7 @@ if S.page == "studio":
                             f'<div class="studio-tiledesc">{safe_html(r.ru_desc if S.ui_lang=="RU" else r.en_desc)}</div></div>',
                             unsafe_allow_html=True)
                 if st.button(tr("Выбрать", "Select") if not active else tr("✓ Выбрано", "✓ Selected"),
-                             key="recipe_"+r.slug, use_container_width=True):
+                             key="recipe_"+r.slug, width='stretch'):
                     if r.kind=="navigate":
                         S.page=r.route
                     else:
@@ -607,7 +781,7 @@ if S.page == "studio":
                    "Enter an idea above. Your channel niche can be used as a starting point."))
     gen_a,gen_b=st.columns(2)
     with gen_a:
-        if st.button(tr("Создать бесплатный черновик", "Create free draft"), use_container_width=True, disabled=not bool(selected)):
+        if st.button(tr("Создать бесплатный черновик", "Create free draft"), width='stretch', disabled=not bool(selected)):
             if not selected:
                 st.warning(tr("Сначала выбери инструмент.", "Select a tool first."))
             else:
@@ -625,6 +799,8 @@ if S.page == "studio":
                 sys_msg,prompt=ai_prompts(selected.slug,idea_text or p["niche"],p,S.language_output)
                 sys_msg += (" Technical generator prompts must be in " + ("Russian" if S.prompt_language=="RU" else "English") + ". ")
                 sys_msg += " Only deliver the selected tool's output, do not append unrelated formats or scripts. "
+                if selected.slug in ("reels_script", "short_story", "reels_teardown"):
+                    sys_msg += " " + creative_director_rules()
                 try:
                     with st.spinner(tr("Готовим результат с AI…", "Creating with AI…")):
                         S.studio_output=generate_ai(sys_msg,prompt)
@@ -641,7 +817,7 @@ if S.page == "studio":
         with st.container(border=True):
             st.markdown(S.studio_output)
         exports_ui(S.studio_output,selected.slug,(idea_text.strip() or p["niche"])[:90],"studio_export")
-        if st.button(tr("♡ Сохранить в библиотеку", "♡ Save to library"), key="save_studio", use_container_width=True):
+        if st.button(tr("♡ Сохранить в библиотеку", "♡ Save to library"), key="save_studio", width='stretch'):
             add_library(selected.slug,(idea_text.strip() or p["niche"])[:90],S.studio_output)
         if st.button(tr("← Все инструменты", "← All tools"),key="studio_back"):
             navigate("studio")
@@ -735,7 +911,7 @@ elif S.page == "trends":
             with st.container(border=True):
                 a,b=st.columns([1,2.4])
                 with a:
-                    if v["thumbnail"]: st.image(v["thumbnail"],use_container_width=True)
+                    if v["thumbnail"]: st.image(v["thumbnail"],width='stretch')
                 with b:
                     st.markdown(f"**{v['title']}**")
                     st.caption(f"{v['channel']} · {v['published'][:10]} · {v['duration_s']}s")
@@ -767,12 +943,12 @@ elif S.page == "scripts":
         st.markdown(f'<div class="v-card" style="min-height:40px;padding:13px 18px;margin:7px 0"><span class="v-tag">{i+1:02} · {safe_html(kind)}</span> {safe_html(h)}</div>',unsafe_allow_html=True)
     a,b=st.columns(2)
     with a:
-        if st.button(tr("Создать шаблон бесплатно", "Create free template"),use_container_width=True):
+        if st.button(tr("Создать шаблон бесплатно", "Create free template"),width='stretch'):
             S.script=demo_script(topic,p["niche"],S.language_output,p["duration"])
             S.script_title=topic
             add_library("script",topic,S.script)
     with b:
-        if st.button(tr("✨ Сгенерировать сценарий с AI", "✨ Generate with AI"),type="primary",use_container_width=True):
+        if st.button(tr("✨ Сгенерировать сценарий с AI", "✨ Generate with AI"),type="primary",width='stretch'):
             try:
                 with st.spinner(tr("Создаём сценарий...", "Generating script...")):
                     S.script=run_ai("script",topic,extra)
@@ -791,13 +967,13 @@ elif S.page == "week":
     header("04 / EDITORIAL CALENDAR",tr("План на семь дней", "Seven-day calendar"),tr("Меняй темы, отмечай готовность и открывай сценарии одним нажатием.", "Edit topics, track progress and jump into script writing."))
     a,b=st.columns(2)
     with a:
-        if st.button(tr("Создать шаблон недели", "Build week template"),use_container_width=True):
+        if st.button(tr("Создать шаблон недели", "Build week template"),width='stretch'):
             for i in range(7):
                 S.pop(f"topic_{S.current}_{i}", None)
                 S.pop(f"status_{S.current}_{i}", None)
             p["week"]=demo_week(p["niche"],S.ui_lang)
     with b:
-        if st.button(tr("✨ План недели с AI", "✨ Create AI week plan"),type="primary",use_container_width=True):
+        if st.button(tr("✨ План недели с AI", "✨ Create AI week plan"),type="primary",width='stretch'):
             try:
                 with st.spinner(tr("Составляем план...", "Planning...")):
                     raw=run_ai("week",p["niche"])
@@ -835,6 +1011,17 @@ elif S.page == "review":
            tr('Анализ → 3 идеи → свой сценарий', 'Analyze → 3 ideas → original script'),
            tr('От реальных данных и кадров к готовой раскадровке и промптам.',
               'From real evidence and selected frames to your own complete storyboard.'))
+    st.subheader(tr('Стиль будущего оригинального видео', 'Style of YOUR new video'))
+    style_index=0 if S.get('review_style','animals')=='animals' else 1
+    style_selected=st.selectbox(tr('Выбери направление', 'Choose direction'),
+        list(CONTENT_STYLES), index=style_index,
+        format_func=lambda k:CONTENT_STYLES[k], key='review_style_picker')
+    if S.get('review_style','animals') != style_selected and S.get('review_original'):
+        st.warning(tr('После смены направления перезапусти анализ, чтобы три идеи соответствовали новому стилю.',
+                      'Rerun the analysis after changing style to regenerate matching ideas.'))
+    S.review_style=style_selected
+    st.caption(tr('Стиль влияет на новые идеи и сценарий, но не искажает анализ оригинального ролика.',
+                  'Style guides original ideas and scripts, not factual analysis of the source.'))
     st.info(tr('YouTube API показывает статистику, но не передаёт само видео для просмотра. '
                'Для визуального анализа добавь ключевые кадры (скриншоты) или описание сцен. '
                'DeepSeek Flash сможет изучить загруженные кадры.',
@@ -894,7 +1081,7 @@ elif S.page == "review":
     st.subheader(tr('Шаг 1. Разобрать ролик и получить три новые идеи',
                     'Step 1. Analyze the source and get three new ideas'))
     if st.button(tr('✨ Анализировать и предложить 3 идеи', '✨ Analyze and suggest 3 ideas'),
-                 type='primary',key='review_deep_analyze',use_container_width=True):
+                 type='primary',key='review_deep_analyze',width='stretch'):
         if not (url.strip() or transcript.strip() or frames or video_upload):
             st.warning(tr('Добавь ссылку, описание или кадры.', 'Provide a link, scene notes, or frames.'))
         else:
@@ -914,18 +1101,23 @@ elif S.page == "review":
                 input_frames=list(frames or [])[:8]
                 if video_upload and not input_frames:
                     input_frames=_frames_from_uploaded_video(video_upload)
-                system,prompt=analysis_prompts(metadata,transcript,len(input_frames))
+                system,prompt=analysis_prompts(metadata,transcript,len(input_frames),S.review_style)
                 with st.spinner(tr('Анализируем факты, кадры и предлагаем идеи...',
                                    'Analyzing evidence and building original ideas...')):
-                    generated=analyze_with_frames(system,prompt,input_frames) if input_frames else generate_ai(system,prompt)
+                    generated=(analyze_with_frames(system,prompt,input_frames) if input_frames else
+                        (_deepseek_flash(system,prompt,effort='low') if S.get('ai_provider')=='DeepSeek' else generate_ai(system,prompt)))
                 S.review=generated; S.review_original=generated
                 S.review_adaptation=''
+                S.review_adaptation_idea=None
                 S.pop('review_idea_choice',None)
                 S.review_source_url=url
                 S.review_evidence='frames' if input_frames else ('notes' if transcript.strip() else 'metadata')
+                S.review_style_for_analysis=S.review_style
                 add_library('analysis',((video or {}).get('title') or url or 'Video analysis')[:90],generated,url)
+                st.rerun()
             except ApiError as err: st.error(str(err))
     if S.get('review_original') and S.get('review_source_url')==url:
+        style_matches=(S.get('review_style_for_analysis', S.get('review_style','animals'))==S.get('review_style','animals'))
         st.success(tr('Анализ готов. Выбери идею и получи собственный сценарий.',
                       'Analysis ready. Choose an idea to create an original script.'))
         with st.expander(tr('Показать полный анализ и три идеи', 'Full analysis and three ideas'), expanded=True):
@@ -940,22 +1132,119 @@ elif S.page == "review":
              key='review_custom_idea',height=90)
         if st.button(tr('🎬 Создать МОЙ сценарий с раскадровкой',
                         '🎬 Create MY script and storyboard'),type='primary',
-                        key='review_make_script',use_container_width=True):
-            system,prompt=adaptation_prompts(S.review_original,idea,custom)
+                        key='review_make_script',width='stretch',disabled=not style_matches):
+            system,prompt=adaptation_prompts(S.review_original,idea,custom,S.get("review_style","animals"))
             try:
                 with st.spinner(tr('Создаём оригинальную историю, тайминг и промпты...',
                                    'Creating your original storyline and shot prompts...')):
                     text=generate_ai(system,prompt)
                 S.review_adaptation=text
+                S.review_adaptation_idea=idea
                 title=(f'Original idea {idea} · '+((video or {}).get('title') or 'Shorts'))[:90]
                 add_library('original_script',title,text,url)
+                st.rerun()
             except ApiError as err: st.error(str(err))
-    if S.get('review_adaptation') and S.get('review_source_url')==url:
+    if (S.get('review_adaptation') and S.get('review_source_url')==url
+            and S.get('review_adaptation_idea')==S.get('review_idea_choice')):
         st.subheader(tr('Шаг 3. Твой готовый сценарий', 'Step 3. Your finished original script'))
         st.markdown(S.review_adaptation)
         exports_ui(S.review_adaptation,'Original_Script',f'Idea_{S.review_idea_choice}_Shorts','review_adapt_export')
         st.caption(tr('Сценарий сохранён в библиотеку этого проекта.',
                       'The original script is saved in this project library.'))
+
+elif S.page == "story":
+    header('STORY → VIDEO', tr('Своя история → три идеи → готовый сценарий',
+                              'Your story → three ideas → production-ready script'),
+           tr('Без YouTube-ссылок. Для реальных воспоминаний и новых оригинальных сюжетов.',
+              'No YouTube link needed. Adapt your own memories or original premises.'))
+    st.info(tr('Семейные видео: только полностью вымышленные AI-персонажи. '
+               'Для английской аудитории — естественный английский юмор, без буквального перевода русских поговорок.',
+               'Family videos: fully fictional AI characters only. English-native humor, not literal translations of Russian idioms.'))
+    if S.get('story_style_picker') not in CONTENT_STYLES:
+        S.story_style_picker='family'
+    story_style=st.selectbox(tr('Направление ролика', 'Video genre'), list(CONTENT_STYLES),
+        format_func=lambda x: CONTENT_STYLES[x], key='story_style_picker')
+    story_text=st.text_area(tr('Опиши случай или придуманный сюжет', 'Describe your experience or original idea'),
+        key='story_source_input', height=175, placeholder=tr(
+            'Например: мама попросила старшую сестру присмотреть за младенцем. Малыш плакал, сестра пыталась его утешить...',
+            'For example: a little girl tries to console her baby brother; when she cries too, he stops and stares.'))
+    guidance=st.text_input(tr('Дополнительное пожелание (необязательно)', 'Extra direction (optional)'),
+        key='story_guidance', placeholder=tr('Больше визуального юмора, минимум диалогов',
+                                            'More visual comedy, minimal dialogue'))
+    # Let a personal story borrow a narrative *principle* from a saved YouTube analysis.
+    # The reference is optional: the Story → Video workflow works without YouTube.
+    available_analyses=[x for x in S.library if x.get('project','My channel')==S.current
+                        and x.get('type')=='analysis' and x.get('content')]
+    reference_options=['']+[str(i) for i in range(len(available_analyses))]
+    story_reference=st.selectbox(
+        tr('Использовать приём из анализа YouTube (необязательно)',
+           'Borrow storytelling techniques from a saved analysis (optional)'),
+        reference_options,
+        format_func=lambda x: (tr('Без референса — только моя история', 'No reference — my own story')
+                               if x=='' else available_analyses[int(x)].get('title','Analysis')[:85]),
+        key='story_reference_picker',
+        help=tr('Используются принципы интриги и юмора, не чужие кадры или реплики.',
+                'Only general hook and comic principles, never source footage or dialogue.'))
+    reference_content=(available_analyses[int(story_reference)].get('content','')
+                       if story_reference else '')
+    reference_marker=(hashlib.sha256(reference_content.encode()).hexdigest()[:16]
+                      if reference_content else '')
+    if st.button(tr('✨ Предложить 3 оригинальные идеи', '✨ Generate 3 original concepts'),
+                 key='story_generate_ideas', type='primary', width='stretch'):
+        if len(story_text.strip()) < 20:
+            st.warning(tr('Опиши ситуацию хотя бы двумя предложениями.',
+                          'Describe the situation in at least two sentences.'))
+        else:
+            try:
+                sys_msg, user_prompt=story_ideas_prompts(story_text,story_style,guidance,reference_content)
+                with st.spinner(tr('Составляем три идеи...', 'Generating three original concepts...')):
+                    ideas=generate_ai(sys_msg,user_prompt)
+                S.story_ideas=ideas
+                S.story_script=''
+                S.story_script_idea=None
+                S.story_draft_source=story_text.strip()
+                S.story_style_for_ideas=story_style
+                S.story_reference_marker=reference_marker
+                S.story_source=story_text.strip()
+                add_library('story_ideas',story_text.strip()[:85],ideas)
+                st.rerun()
+            except ApiError as exc:
+                st.error(str(exc))
+    active=bool(S.get('story_ideas'))
+    matches=(active and S.get('story_draft_source')==story_text.strip()
+             and S.get('story_style_for_ideas')==story_style
+             and S.get('story_reference_marker','')==reference_marker)
+    if active:
+        if not matches:
+            st.warning(tr('Исходный текст или стиль изменился. Создай три идеи заново перед сценарием.',
+                          'Source text or genre changed. Regenerate the three ideas before writing a script.'))
+        st.subheader(tr('Три оригинальных идеи', 'Three original concepts'))
+        st.markdown(S.story_ideas)
+        exports_ui(S.story_ideas,'Story_Ideas',story_text[:65],'story_ideas_export')
+        number=st.radio(tr('Выбери идею для сценария', 'Choose a concept for the script'),
+                        [1,2,3],horizontal=True,key='story_idea_choice')
+        adjustments=st.text_area(tr('Что изменить в сюжете?', 'Customize the story'),
+            key='story_script_custom',height=80,
+            placeholder=tr('Например: действие в британском доме; смешная пауза в конце',
+                           'For example: set in a British home; a funny silent reaction at the end'))
+        if st.button(tr('🎬 Создать готовый сценарий и промпты',
+                        '🎬 Create full script and clip prompts'),
+                     key='story_make_script',type='primary',width='stretch',disabled=not matches):
+            try:
+                sys_msg,user_prompt=story_script_prompts(S.story_ideas,number,story_style,adjustments)
+                with st.spinner(tr('Создаём раскадровку и промпты...',
+                                   'Generating storyboard and clip prompts...')):
+                    script=generate_ai(sys_msg,user_prompt)
+                S.story_script=script
+                S.story_script_idea=number
+                add_library('story_script',f'Story idea {number} · {story_text[:60]}',script)
+                st.rerun()
+            except ApiError as exc:
+                st.error(str(exc))
+    if matches and S.get('story_script') and S.get('story_script_idea')==S.get('story_idea_choice'):
+        st.subheader(tr('Готовый производственный сценарий', 'Production-ready video package'))
+        st.markdown(S.story_script)
+        exports_ui(S.story_script,'Story_Script',f'Idea_{S.get("story_idea_choice",1)}','story_script_export')
 
 elif S.page == "library":
     header("06 / CREATIVE VAULT",tr("Библиотека идей", "Saved content library"),tr("Сценарии и интересные ролики не теряются в переписке.", "Keep scripts, links and ideas together."))
@@ -966,6 +1255,25 @@ elif S.page == "library":
         with st.expander(f"{item['type'].upper()} · {item['title']} · {item['added']}"):
             if item.get("url"): st.link_button(tr("Открыть источник", "Open source"),item["url"])
             st.markdown(item["content"])
+            if item.get('type')=='story_ideas':
+                if st.button(tr('📖 Продолжить: создать сценарий',
+                                '📖 Continue: make a script'),key=f'continue_story_{i}'):
+                    S.story_ideas=item.get('content','')
+                    S.story_script=''
+                    S.story_script_idea=None
+                    S.story_source=item.get('source_story') or item.get('title','')
+                    S.story_draft_source=S.story_source
+                    S.story_source_input=S.story_source
+                    S.story_style_for_ideas=item.get('creative_style','family') or 'family'
+                    S.story_style_picker=S.story_style_for_ideas
+                    stored_ref=item.get('reference_marker','')
+                    matching_refs=[str(j) for j, a in enumerate([
+                        x for x in S.library if x.get('project','My channel')==S.current
+                        and x.get('type')=='analysis' and x.get('content')])
+                        if hashlib.sha256(a.get('content','').encode()).hexdigest()[:16]==stored_ref]
+                    S.story_reference_picker=matching_refs[0] if stored_ref and matching_refs else ''
+                    S.story_reference_marker=stored_ref if matching_refs else ''
+                    navigate('story')
             if item.get('type')=='analysis':
                 if st.button(tr('🎬 Продолжить: выбрать идею и создать сценарий',
                                 '🎬 Continue: select an idea and generate script'),key=f'continue_{i}'):
@@ -976,6 +1284,9 @@ elif S.page == "library":
                     S.review_source_url=item.get('url','')
                     S.review_adaptation=''
                     S.review_idea_choice=1
+                    S.review_style=item.get('creative_style','animals')
+                    S.review_style_for_analysis=S.review_style
+                    S.pop('review_style_picker',None)
                     navigate('review')
             exports_ui(item["content"],item["type"],item["title"],f"library_{i}")
             if st.button(tr("Удалить", "Delete"),key=f"delete_{i}"):
@@ -1010,7 +1321,7 @@ elif S.page == "metrics":
         for v in own:
             engagement=round(100*(v["likes"]+v["comments"]+v["saves"])/v["views"],2) if v["views"] else 0
             rows.append({tr("Ролик", "Video"):v["title"],tr("Просмотры", "Views"):v["views"],tr("Лайки", "Likes"):v["likes"],tr("Комментарии", "Comments"):v["comments"],"Interactions / views %":engagement})
-        st.dataframe(rows,use_container_width=True,hide_index=True)
+        st.dataframe(rows,width='stretch',hide_index=True)
         st.caption(tr("Показатель interactions/views — простое отношение введённых взаимодействий к просмотрам, не официальный ER платформы.", "Interactions/views is a basic ratio of entered interactions to views, not a platform's official engagement rate."))
         st.subheader(tr("Управление записями", "Manage records"))
         for i,v in enumerate(S.videos):
